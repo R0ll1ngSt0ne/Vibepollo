@@ -37,7 +37,18 @@ bool companion_runtime_available(){return runtime_available;}
 bool companion_steam_app(const ctx_t& app){return !app.steam_id.empty()&&app.playnite_id.empty()&&!app.playnite_fullscreen&&app.lutris_id.empty();}
 struct unsupported_proc_t : proc_t {bool check_companion_account(const std::string&,bool,bool,const ctx_t* = nullptr) const;};
 DWORD GetModuleFileNameW(void*,wchar_t* out,DWORD size){++module_calls;auto s=executable.wstring();assert(s.size()<size);std::copy(s.begin(),s.end(),out);return s.size();}
-struct Child {bool wait_for(std::chrono::seconds){return true;}void terminate(std::error_code&){}void detach(){}int exit_code(){return exit_status;}};
+bool simulate_timeout=false,termination_fails=false;
+int terminations=0,detachments=0,exit_reads=0;
+std::vector<long long> waits;
+struct Child {
+ bool wait_for(std::chrono::seconds duration){
+   waits.push_back(duration.count());
+   return !simulate_timeout || (duration==std::chrono::seconds(2)&&!termination_fails);
+ }
+ void terminate(std::error_code& error){++terminations;if(termination_fails)error=std::make_error_code(std::errc::permission_denied);}
+ void detach(){++detachments;}
+ int exit_code(){++exit_reads;return exit_status;}
+};
 namespace platf {namespace dxgi {std::string wide_to_utf8(const std::wstring& s){return std::string(s.begin(),s.end());}}
 Child run_command(bool,bool interactive,const std::string& command,const std::filesystem::path&,bp::environment env,void* output,std::error_code&,void*){assert(!interactive&&output);std::fputs("{\"status\":\"account_ready\"}\n",static_cast<FILE*>(output));++helper_calls;selected=env["VIBEPOLLO_COMPANION_STEAM_ID"];command_seen=command;return {};}}
 namespace nvhttp {
@@ -80,7 +91,11 @@ assert(helper_calls==before); // No updater interference, account switch, or del
  acquired.get_future().wait();
  auto recovery=std::async(std::launch::async,[&]{return companion_account_gate("mapped",{},true,false,nullptr,true,false);});
  const bool prompt=recovery.wait_for(std::chrono::seconds(1))==std::future_status::ready;
+ auto protected_launch=std::async(std::launch::async,[&]{return companion_account_gate("mapped",{},true);});
+ const bool rejected_promptly=protected_launch.wait_for(std::chrono::seconds(1))==std::future_status::ready;
  release.set_value();blocked.get();assert(prompt&&recovery.get());
+ assert(rejected_promptly&&!protected_launch.get());
+ assert(helper_calls==before); // Contention must not select an account or start a helper.
 }
 
 proc_t process;
@@ -107,6 +122,24 @@ assert(helper_calls==calls_after_optional);
 unsupported_proc_t unsupported;exit_status=4;
 assert(unsupported.check_companion_account("mapped",true,false,&game));
 assert(helper_calls==calls_after_optional);
+// Execute the real timeout branches without sleeping or terminating any process.
+// A nominal success exit code must not turn a timed-out helper into admission.
+exit_status=0;simulate_timeout=true;
+for(bool failed:{false,true}) {
+ termination_fails=failed;waits.clear();terminations=detachments=exit_reads=0;
+ const auto previous_calls=helper_calls;
+ assert(!companion_account_gate("mapped",{},true));
+ assert(helper_calls==previous_calls+1);
+ assert((waits==std::vector<long long>{30,2}));
+ assert(terminations==1&&detachments==(failed?1:0)&&exit_reads==0);
+ // Timeout releases the policy lock even when its own helper cannot terminate.
+ auto unlocked=std::async(std::launch::async,[]{std::unique_lock lock(steam_account_policy::launch_mutex(),std::try_to_lock);return lock.owns_lock();});
+ assert(unlocked.get());
+ assert(companion_account_gate("mapped",{},true,false,nullptr,true,false));
+ assert(helper_calls==previous_calls+1); // Recovery starts no replacement helper.
+}
+simulate_timeout=false;termination_fails=false;
+assert(companion_account_gate("mapped",{},true)); // A later verified attempt can recover.
 }
 '''
 with tempfile.TemporaryDirectory(prefix='unmapped-passthrough-') as d:
@@ -114,4 +147,4 @@ with tempfile.TemporaryDirectory(prefix='unmapped-passthrough-') as d:
  cpp=path/'test.cpp';exe=path/'test.exe';cpp.write_text(prefix+lookup+'}\n'+gate+admission+'\n#undef _WIN32\n'+admission.replace('proc_t::','unsupported_proc_t::')+'\n#define _WIN32\n'+suffix)
  subprocess.run([sys.argv[1],'-std=c++20','-iquote',str(root/'src'),str(cpp),'-o',str(exe)],check=True)
  subprocess.run([str(exe),str(path)],check=True,timeout=15)
-print('Production unmapped account gate: admission succeeds with zero helper effects; mapped target retained; current config never selects PASS')
+print('Production unmapped account gate: admission succeeds with zero helper effects; mapped target retained; current config never selects; contention fails fast; timeout/failed termination deny and release lock PASS')

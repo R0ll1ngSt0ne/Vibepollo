@@ -48,6 +48,8 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci
+      - run: npm ci
+        working-directory: src_assets/common/assets/web-legacy
       - run: npm run test:unit
       - run: npm run build
       - run: npx playwright install --with-deps chromium

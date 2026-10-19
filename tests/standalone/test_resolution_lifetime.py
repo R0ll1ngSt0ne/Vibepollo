@@ -4,6 +4,8 @@ root=pathlib.Path(__file__).resolve().parents[2]
 s=(root/'src/platform/windows/misc.cpp').read_text()
 a=s.index('  STARTUPINFOEXW create_startup_info(');b=s.index('\n  }',a)+4
 startup=s[a:b]
+compat_start=s.index('#ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST')
+compat=s[compat_start:s.index('#endif',compat_start)+len('#endif')]
 prefix=r'''
 #include <windows.h>
 #include <cassert>
@@ -42,7 +44,7 @@ int main(int argc,char** argv){
 }
 '''
 with tempfile.TemporaryDirectory(prefix='resolution-lifetime-') as directory:
-    path=pathlib.Path(directory);cpp=path/'test.cpp';exe=path/'test.exe';cpp.write_text(prefix+startup+suffix)
+    path=pathlib.Path(directory);cpp=path/'test.cpp';exe=path/'test.exe';cpp.write_text(prefix+compat+'\n'+startup+suffix)
     subprocess.run([sys.argv[1],'-std=c++20',str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True,timeout=15)
 print('Production lifetime handle: child inherits SYNCHRONIZE-only handle without host ACL changes PASS')
