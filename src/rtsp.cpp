@@ -198,6 +198,7 @@ namespace rtsp_stream {
 
     // Carry the pending display-power hold into active capture without a gap.
     snapshot->display_power_guard = display_power_guard;
+    snapshot->audio_startup_guard = audio_startup_guard;
     snapshot->id = id;
     snapshot->role = role;
     snapshot->role_generation = role_generation;

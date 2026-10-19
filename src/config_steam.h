@@ -10,6 +10,9 @@
 namespace config {
   struct steam_t {
     bool enabled = false;
+    bool account_management = false;
+    bool account_management_configured = false;
+    bool resolution_automation = false;
     bool auto_sync = false;
     bool sync_all_installed = false;
     int recent_games = 10;

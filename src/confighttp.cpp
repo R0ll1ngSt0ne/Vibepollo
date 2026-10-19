@@ -62,6 +62,7 @@
 #include "log_export.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "steam_account_policy.h"
 #include "remote_display_topology.h"
 #include "remote_session.h"
 #include "platform/common.h"
@@ -552,6 +553,7 @@ namespace confighttp {
           continue;
         }
 
+        if (key == "steam_account_management" || key == "steam_resolution_automation") return false;
         if (key.rfind("steam_", 0) == 0) {
           continue;
         }
@@ -2643,6 +2645,13 @@ namespace confighttp {
    *
    * @api_examples{/api/clients/list| GET| null}
    */
+  void getRememberedSteamAccounts(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    // Private account names are returned only to the authenticated UI, never
+    // logged or cached. No query can select an account or start Steam here.
+    send_response(response, proc::remembered_steam_accounts(), "no-store");
+  }
+
   void getClients(resp_https_t response, req_https_t request) {
     if (!authenticate(response, request)) {
       return;
@@ -2893,6 +2902,14 @@ namespace confighttp {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       nlohmann::json output_tree;
       std::string uuid = input_tree.value("uuid", "");
+      std::optional<std::string> steam_account_id;
+      if (input_tree.contains("steam_account_id")) {
+        steam_account_id = input_tree.at("steam_account_id").get<std::string>();
+        if (!steam_account_policy::valid_assignment(*steam_account_id)) {
+          bad_request(response, request, "Invalid Steam account assignment");
+          return;
+        }
+      }
       std::optional<std::string> hdr_profile;
       if (input_tree.contains("hdr_profile")) {
         if (input_tree["hdr_profile"].is_null()) {
@@ -2917,8 +2934,18 @@ namespace confighttp {
         input_tree.contains("do") ||
         input_tree.contains("undo");
 
-      if (!has_extended_fields && hdr_profile.has_value()) {
+      if (!has_extended_fields && !steam_account_id.has_value() && hdr_profile.has_value()) {
         output_tree["status"] = nvhttp::set_client_hdr_profile(uuid, hdr_profile.value());
+        send_response(response, output_tree);
+        return;
+      }
+
+      if (!has_extended_fields && steam_account_id.has_value()) {
+        bool updated = nvhttp::set_client_steam_account(uuid, *steam_account_id);
+        if (updated && hdr_profile.has_value()) {
+          updated = nvhttp::set_client_hdr_profile(uuid, *hdr_profile);
+        }
+        output_tree["status"] = updated;
         send_response(response, output_tree);
         return;
       }
@@ -2993,6 +3020,9 @@ namespace confighttp {
           hdr_profile
         )
                   && updated;
+      }
+      if (updated && steam_account_id.has_value()) {
+        updated = nvhttp::set_client_steam_account(uuid, *steam_account_id);
       }
       output_tree["status"] = updated;
       send_response(response, output_tree);
@@ -6296,6 +6326,7 @@ namespace confighttp {
     register_api_route("^/api/apps/([0-9]+)$", "DELETE", deleteApp);
     register_api_route("^/api/clients/unpair-all$", "POST", unpairAll);
     register_api_route("^/api/clients/list$", "GET", getClients);
+    register_blocking_api_route("^/api/clients/steam-accounts$", "GET", getRememberedSteamAccounts);
     register_blocking_api_route("^/api/clients/display-layout$", "GET", getClientDisplayLayout);
     register_blocking_api_route("^/api/clients/display-layout$", "PUT", putClientDisplayLayout);
     register_api_route("^/api/clients/hdr-profiles$", "GET", getHdrProfiles);

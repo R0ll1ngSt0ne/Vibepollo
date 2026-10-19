@@ -10,6 +10,14 @@
 #include <string>
 
 namespace audio::policy {
+  template<class Endpoint, std::size_t Count>
+  void fill_missing_role_snapshot(std::array<Endpoint, Count> &captured,
+                                  const std::array<Endpoint, Count> &current) {
+    for (std::size_t index = 0; index < Count; ++index) {
+      if (captured[index].empty()) captured[index] = current[index];
+    }
+  }
+
   struct stream_layout_t {
     int channels;
     int streams;

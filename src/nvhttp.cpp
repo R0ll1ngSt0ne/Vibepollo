@@ -43,6 +43,8 @@
 
 // local includes
 #include "app_display_policy.h"
+#include "audio.h"
+#include "steam_account_policy.h"
 #include "config.h"
 #include "display_device.h"
 #include "display_helper_integration.h"
@@ -101,6 +103,9 @@ namespace nvhttp {
       remote_session::role_e role {remote_session::role_e::none};
       std::uint64_t generation {};
       std::string client_uuid;
+      // A retained/retryable Remote Monitor still owns topology after transport
+      // loss. Keep its pre-display audio baseline until that owner is released.
+      std::shared_ptr<void> audio_startup_guard;
     };
 
     std::mutex remote_role_owners_mutex;
@@ -152,9 +157,17 @@ namespace nvhttp {
       return result;
     }
 
-    void remember_remote_owner(std::string_view uuid, remote_session::role_e role, std::uint64_t generation) {
-      std::lock_guard lock {remote_role_owners_mutex};
-      remote_role_owners.insert_or_assign(remote_role_owner_key(uuid, role), remote_role_owner_t {role, generation, std::string {uuid}});
+    void remember_remote_owner(std::string_view uuid, remote_session::role_e role, std::uint64_t generation,
+                               std::shared_ptr<void> audio_guard = {}) {
+      std::shared_ptr<void> retired;
+      {
+        std::lock_guard lock {remote_role_owners_mutex};
+        const auto key = remote_role_owner_key(uuid, role);
+        const auto previous = remote_role_owners.find(key);
+        if (previous != remote_role_owners.end()) retired = std::move(previous->second.audio_startup_guard);
+        remote_role_owners.insert_or_assign(key, remote_role_owner_t {role, generation, std::string {uuid}, std::move(audio_guard)});
+      }
+      // Final audio release can start recovery; never do it under the owner map lock.
     }
 
     std::optional<std::uint64_t> remote_owner_generation(std::string_view uuid, remote_session::role_e role) {
@@ -164,24 +177,31 @@ namespace nvhttp {
     }
 
     void forget_remote_owner(std::string_view uuid, remote_session::role_e role, std::uint64_t generation) {
-      std::lock_guard lock {remote_role_owners_mutex};
-      const auto key = remote_role_owner_key(uuid, role);
-      const auto it = remote_role_owners.find(key);
-      if (it != remote_role_owners.end() && it->second.generation == generation) remote_role_owners.erase(it);
+      decltype(remote_role_owners)::node_type retired;
+      {
+        std::lock_guard lock {remote_role_owners_mutex};
+        const auto key = remote_role_owner_key(uuid, role);
+        const auto it = remote_role_owners.find(key);
+        if (it != remote_role_owners.end() && it->second.generation == generation) retired = remote_role_owners.extract(it);
+      }
     }
 
     void forget_remote_client(std::string_view uuid) {
+      decltype(remote_role_owners)::node_type monitor, input;
       {
         std::lock_guard lock {remote_role_owners_mutex};
-        remote_role_owners.erase(remote_role_owner_key(uuid, remote_session::role_e::monitor));
-        remote_role_owners.erase(remote_role_owner_key(uuid, remote_session::role_e::input));
+        monitor = remote_role_owners.extract(remote_role_owner_key(uuid, remote_session::role_e::monitor));
+        input = remote_role_owners.extract(remote_role_owner_key(uuid, remote_session::role_e::input));
       }
       remote_session::clear_app_replacement_confirmation(uuid);
     }
 
     void forget_all_remote_clients() {
-      std::lock_guard lock {remote_role_owners_mutex};
-      remote_role_owners.clear();
+      decltype(remote_role_owners) retired;
+      {
+        std::lock_guard lock {remote_role_owners_mutex};
+        retired.swap(remote_role_owners);
+      }
     }
 
     bool has_stream_session_activity() {
@@ -1360,6 +1380,14 @@ namespace nvhttp {
       const std::chrono::steady_clock::time_point display_startup_deadline
     ) {
 
+      // Acquire the same context later used by capture BEFORE topology changes
+      // can remove a physical HDMI/DP endpoint. Retained contexts preserve the
+      // earlier app owner's snapshot on reconnect; this is not a second writer.
+      // The session holds the reference across asynchronous RTSP startup.
+      if (!is_input_only && !launch_session->audio_startup_guard) {
+        audio::acquire_startup_guard(launch_session->audio_startup_guard);
+      }
+
       // This routine is the authoritative resolver for normal NVHTTP launch
       // and resume requests. proc::execute must not later re-enable a virtual
       // display after a per-app physical output override selected one.
@@ -2246,6 +2274,7 @@ namespace nvhttp {
           named_cert_node["cert"] = named_cert_p->cert;
           named_cert_node["uuid"] = named_cert_p->uuid;
           named_cert_node["display_mode"] = named_cert_p->display_mode;
+          named_cert_node["steam_account_id"] = named_cert_p->steam_account_id;
           if (!named_cert_p->virtual_display_mode_override.empty()) {
             named_cert_node["virtual_display_mode"] = named_cert_p->virtual_display_mode_override;
           }
@@ -2388,6 +2417,10 @@ namespace nvhttp {
               named_cert_p->uuid = el.value("uuid", "");
               named_cert_p->display_mode = el.value("display_mode", "");
               named_cert_p->hdr_profile = el.value("hdr_profile", "");
+              const auto steam_account_id = el.value("steam_account_id", "");
+              if (steam_account_policy::valid_assignment(steam_account_id)) {
+                named_cert_p->steam_account_id = steam_account_id;
+              }
               named_cert_p->output_name_override = el.value("output_name_override", "");
               named_cert_p->virtual_display_mode_override = el.value("virtual_display_mode", "");
               named_cert_p->virtual_display_layout_override = el.value("virtual_display_layout", "");
@@ -4096,6 +4129,8 @@ namespace nvhttp {
         named_cert_node["name"] = named_cert->name;
         named_cert_node["uuid"] = named_cert->uuid;
         named_cert_node["display_mode"] = named_cert->display_mode;
+        named_cert_node["steam_account_id"] = named_cert->steam_account_id;
+        named_cert_node["steam_account_status"] = named_cert->steam_account_id.empty() ? "unassigned" : "verification_required";
         if (!named_cert->hdr_profile.empty()) {
           named_cert_node["hdr_profile"] = named_cert->hdr_profile;
         }
@@ -4592,6 +4627,11 @@ namespace nvhttp {
           return;
         }
 
+        if (!proc::proc.check_companion_account(request_client_identity.uuid, false, true)) {
+          tree.put("root.<xmlattr>.status_code", 403);
+          tree.put("root.<xmlattr>.status_message", "Mapped Steam account is not ready");
+          return;
+        }
         const bool no_active_sessions = !has_stream_session_activity();
         const auto runtime_app = proc::proc.resolve_app(
           "0",
@@ -4681,6 +4721,12 @@ namespace nvhttp {
         launch_session->host_audio = remote_session::uses_host_audio(launch_session->role);
         launch_session->continuous_audio = false;
         if (launch_session->role == remote_session::role_e::monitor) {
+#ifdef _WIN32
+          // Synthetic Remote Monitor bypasses both normal display preparation
+          // and proc::execute. Capture before its runtime callbacks create a VDD
+          // or apply topology, even when capture audio will be disabled.
+          audio::acquire_startup_guard(launch_session->audio_startup_guard);
+#endif
 #ifdef __linux__
           launch_session->display_power_guard = platf::display_power::acquire();
           if (!launch_session->display_power_guard) {
@@ -4713,7 +4759,8 @@ namespace nvhttp {
             remember_remote_owner(
               request_client_identity.uuid,
               launch_session->role,
-              launch_session->role_generation
+              launch_session->role_generation,
+              launch_session->audio_startup_guard
             );
           }
           if (!monitor.ready || monitor.output.empty()) {
@@ -4793,6 +4840,7 @@ namespace nvhttp {
         return;
       }
       std::unique_lock normal_transition_lock {normal_http_app_transition_mutex};
+      std::shared_ptr<void> companion_audio_guard;
       auto requested_app = proc::proc.resolve_app(appid_str, appuuid_str);
       auto appid = requested_app ? util::from_view(requested_app->id) : util::from_view(appid_str);
       auto current_app_uuid = proc::proc.get_running_app_uuid();
@@ -4820,6 +4868,8 @@ namespace nvhttp {
 
         return;
       }
+      bool companion_replacement_admitted = false;
+      const bool joining_current = current_appid > 0 && (appid == current_appid || (!appuuid_str.empty() && appuuid_str == current_app_uuid));
       if (!is_input_only) {
         // Special handling for the "terminate" app
         if (
@@ -4872,13 +4922,15 @@ namespace nvhttp {
           } else {
             remote_session::clear_app_replacement_confirmation(request_client_identity.uuid);
           }
-          BOOST_LOG(info) << "Replacing running app " << current_appid << " with app " << appid
-                          << " at the request of paired client " << request_client_identity.uuid << ".";
-          (void) rtsp_stream::disconnect_game_sessions(true);
-          proc::proc.terminate(false, true, false, true);
         }
+        companion_replacement_admitted = current_appid > 0 && current_appid != proc::input_only_app_id && ((appid > 0 && appid != current_appid) || (!appuuid_str.empty() && appuuid_str != current_app_uuid));
       }
 
+      if (is_input_only && !proc::proc.check_companion_account(request_client_identity.uuid, false, true)) {
+        tree.put("root.<xmlattr>.status_code", 403);
+        tree.put("root.<xmlattr>.status_message", "Mapped Steam account is not ready");
+        return;
+      }
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
 
       bool no_active_sessions =
@@ -4886,7 +4938,7 @@ namespace nvhttp {
       // Runtime overrides are global process state. Do not reapply them while
       // another RTSP/WebRTC session is active, otherwise a second client can mutate
       // active stream limits (e.g. fps/encoding-related settings) mid-session.
-      const bool update_runtime_overrides = no_active_sessions;
+      const bool update_runtime_overrides = no_active_sessions || companion_replacement_admitted;
 
       // Build the requested layer even when another stream owns the process-wide
       // runtime config. A shared capture may only be joined when its adapter pair
@@ -4919,6 +4971,27 @@ namespace nvhttp {
           "Another stream is active with a different capture adapter selection"
         );
         return;
+      }
+
+      if (!is_input_only) {
+#ifdef _WIN32
+        std::string companion_account;
+        if (requested_app && !joining_current && nvhttp::steam_mapping_for_client(request_client_identity.uuid, companion_account) && !companion_account.empty()) {
+          // Steam restart can itself alter audio topology. Retain the original
+          // role snapshot across account preparation and later stream startup.
+          audio::acquire_startup_guard(companion_audio_guard);
+        }
+#endif
+        if (requested_app && !proc::proc.check_companion_account(request_client_identity.uuid, !joining_current, joining_current, &*requested_app)) {
+          tree.put("root.<xmlattr>.status_code", 403);
+          tree.put("root.<xmlattr>.status_message", "Automatic game launch needs the mapped Steam account. Open Desktop or Steam Big Picture to finish startup or select the account.");
+          return;
+        }
+        if (companion_replacement_admitted) {
+          (void) rtsp_stream::disconnect_game_sessions(true);
+          proc::proc.terminate(false, true, false, true);
+          no_active_sessions = !has_stream_session_activity() && proc::proc.current_app_id() <= 0;
+        }
       }
 
       // Apply per-application runtime config overrides before we build session metadata or
@@ -4999,6 +5072,7 @@ namespace nvhttp {
 #endif
       const bool allow_display_changes = true;
       auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity, request);
+      if (companion_audio_guard) launch_session->audio_startup_guard = std::move(companion_audio_guard);
       std::optional<std::string> pending_output_override;
       auto output_override_guard = util::fail_guard([&]() {
         if (pending_output_override) {
@@ -5393,6 +5467,12 @@ namespace nvhttp {
       return;
     }
 
+    if (!proc::proc.check_companion_account(request_client_identity.uuid, false, true)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Mapped Steam account is not ready");
+      return;
+    }
     // proc_t::terminate() leaves the app id at -1 and nothing resets it to 0, so any
     // non-positive id means nothing is running. Comparing against 0 alone would let a
     // stale /resume run the whole resume path for an app that no longer exists.
@@ -7052,6 +7132,50 @@ namespace nvhttp {
       save_state();
     }
     return updated;
+  }
+
+  bool has_steam_assignments() {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    return std::any_of(client_root.named_devices.begin(), client_root.named_devices.end(),
+      [](const auto &client) { return client && !client->steam_account_id.empty(); });
+  }
+
+  bool steam_mapping_for_client(const std::string &uuid, std::string &account) {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    account.clear();
+    for (const auto &client : client_root.named_devices) {
+      if (!client) continue;
+      if (!uuid.empty() && client->uuid == uuid) account = client->steam_account_id;
+    }
+    return !account.empty();
+  }
+
+  bool set_client_steam_account(const std::string &uuid, const std::string &steam_account_id) {
+    if (uuid.empty() || !steam_account_policy::valid_assignment(steam_account_id)) return false;
+    std::lock_guard launch_lock(steam_account_policy::launch_mutex());
+    // A mapping must survive restart before it can be observed in memory.
+    // Match load/save lock order and keep readers/other updates excluded until
+    // persistence succeeds. No rollback can clobber a newer concurrent update.
+    if (config::sunshine.flags[config::flag::FRESH_STATE]) return false;
+    statefile::migrate_recent_state_keys();
+    std::lock_guard<std::mutex> state_lock(statefile::state_mutex());
+    std::lock_guard<std::mutex> client_lock(client_mutex);
+    auto target = std::find_if(client_root.named_devices.begin(), client_root.named_devices.end(),
+                              [&](const auto &client) { return client && client->uuid == uuid; });
+    if (target == client_root.named_devices.end()) return false;
+    client_t staged = client_root;
+    for (auto &client : staged.named_devices) {
+      if (client && client->uuid == uuid) {
+        client = std::make_shared<crypto::named_cert_t>(*client);
+        client->steam_account_id = steam_account_id;
+      }
+    }
+    if (!save_state_snapshot_locked(staged)) return false;
+    // Swap is non-throwing: allocation cannot fail after the durable commit.
+    auto staged_target = std::find_if(staged.named_devices.begin(), staged.named_devices.end(),
+                                    [&](const auto &client) { return client && client->uuid == uuid; });
+    (*target)->steam_account_id.swap((*staged_target)->steam_account_id);
+    return true;
   }
 
   bool set_client_hdr_profile(const std::string &uuid, const std::string &hdr_profile) {

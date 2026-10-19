@@ -76,4 +76,10 @@ AGENTS.md
 # Local runtime/test artifacts
 test_sunshine.log
 vibeshine_state.json
+sunshine_state.json*
+sunshine.conf
+/.private/
+/runtime/
+/credentials/
+/config/
 .claude/

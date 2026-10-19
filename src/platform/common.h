@@ -706,6 +706,10 @@ namespace platf {
 
   class audio_control_t {
   public:
+    // Release a pre-display snapshot even when capture never assigned a sink.
+    // Platforms without topology-aware recovery have nothing to do here.
+    virtual void restore_topology_snapshot() {}
+
     virtual int set_sink(const std::string &sink) = 0;
 
     // Select a loopback endpoint without changing system routing, when supported.
@@ -790,7 +794,11 @@ namespace platf {
 
   namespace bp = boost_process_shim;
 
-  bp::child run_command(bool elevated, bool interactive, const std::string &cmd, boost::filesystem::path &working_dir, const bp::environment &env, FILE *file, std::error_code &ec, bp::group *group);
+  bp::child run_command(bool elevated, bool interactive, const std::string &cmd, boost::filesystem::path &working_dir, const bp::environment &env, FILE *file, std::error_code &ec, bp::group *group
+#ifdef _WIN32
+                        , std::uintptr_t inherited_lifetime = 0
+#endif
+  );
 
   enum class thread_priority_e : int {
     low,  ///< Low priority

@@ -439,6 +439,10 @@ namespace audio {
     return policy::stream_index(channels, quality);
   }
 
+  void acquire_startup_guard(std::shared_ptr<void> &guard) {
+    if (!guard) guard = std::make_shared<audio_ctx_ref_t>(get_audio_ctx_ref());
+  }
+
   int start_audio_control(audio_ctx_t &ctx) {
     auto fg = util::fail_guard([]() {
       BOOST_LOG(warning) << "There will be no audio"sv;
@@ -477,6 +481,7 @@ namespace audio {
 
   void stop_audio_control(audio_ctx_t &ctx) {
     if (!ctx.restore_sink) {
+      if (ctx.control) ctx.control->restore_topology_snapshot();
       return;
     }
 

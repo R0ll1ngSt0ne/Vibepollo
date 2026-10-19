@@ -105,6 +105,7 @@ namespace crypto {
     std::string cert;
     std::string display_mode;
     std::string hdr_profile;
+    std::string steam_account_id;
     std::string output_name_override;
     std::string virtual_display_mode_override;
     std::string virtual_display_layout_override;

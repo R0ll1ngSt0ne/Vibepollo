@@ -93,6 +93,9 @@ namespace audio {
    */
   audio_ctx_ref_t get_audio_ctx_ref();
 
+  /** @brief Retain the shared pre-topology snapshot once per launch. */
+  void acquire_startup_guard(std::shared_ptr<void> &guard);
+
   /** @brief Mark the current app as terminal and restore retained audio state. */
   void app_termination_requested();
 

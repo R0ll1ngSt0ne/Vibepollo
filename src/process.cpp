@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
@@ -22,7 +23,9 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -101,6 +104,9 @@
 #endif
 #include "rtsp.h"
 #include "state_storage.h"
+#include "steam_account_policy.h"
+#include "companion_integration_policy.h"
+#include "config_steam.h"
 #include "stream.h"
 #include "system_tray.h"
 #include "utility.h"
@@ -125,6 +131,135 @@ namespace proc {
   std::optional<ctx_t> resolve_app_from_snapshot(const std::vector<ctx_t> &apps, const std::string &appid, const std::string &appuuid);
 
   namespace {
+    bool companion_steam_app(const ctx_t &app) {
+      return !app.steam_id.empty() && app.playnite_id.empty() && !app.playnite_fullscreen && app.lutris_id.empty();
+    }
+    bool companion_accounts_enabled() {
+      return companion_integration_policy::account_enabled(config::steam.account_management_configured,
+        config::steam.account_management, nvhttp::has_steam_assignments());
+    }
+    bool companion_runtime_available() {
+#ifdef _WIN32
+      std::array<wchar_t, 32768> module {};
+      auto size = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
+      if (!size || size >= module.size()) return false;
+      std::error_code error;
+      if (!std::filesystem::is_regular_file(std::filesystem::path(module.data()).parent_path() /
+          "stream-companion" / "StreamCompanion.Windows.exe", error)) return false;
+      for (const auto &root : platf::steam::default_library_roots()) {
+        if (std::filesystem::is_regular_file(root / "steam.exe", error)) return true;
+      }
+#endif
+      return false;
+    }
+#ifdef _WIN32
+    bool companion_recovery_ui(const ctx_t &app) {
+      return app.playnite_id.empty() && !app.playnite_fullscreen &&
+             app.lutris_id.empty() && app.lutris_directory.empty() &&
+             app.steam_install_dir.empty() &&
+             app.steam_id.empty() && app.cmd.empty() &&
+             (app.detached.empty() || (app.detached.size() == 1 && app.detached.front() == "steam://open/bigpicture"));
+    }
+
+    bool companion_account_gate(const std::string &client_uuid, bp::environment environment, bool prepare, bool identity_only = false, const char *operation = nullptr, bool recovery_ui = false, bool steam_managed = true) {
+      std::lock_guard lock(steam_account_policy::launch_mutex());
+      std::string account;
+      const bool mapped = companion_accounts_enabled() && nvhttp::steam_mapping_for_client(client_uuid, account);
+      const bool current_config = operation && (std::string_view(operation) == "current-config-env" || std::string_view(operation) == "current-desktop-config-env");
+      if (!current_config && (!steam_managed || !mapped || recovery_ui)) return true;
+      // An unavailable verifier must not launch a protected game under an unknown account.
+      if (!current_config && !companion_runtime_available()) return false;
+      // Unmapped clients retain upstream admission with no identity/selection
+      // helper. Optional configuration uses only the observed current account.
+      if (!mapped && !current_config) return true;
+      if (mapped && recovery_ui) {
+        if (prepare) BOOST_LOG(info) << "Steam recovery UI allowed; mapped identity will be checked before automatic game launch.";
+        return true;
+      }
+      if (client_uuid.empty() || (mapped && account.empty())) {
+        BOOST_LOG(warning) << "Companion blocked launch: explicit client account assignment required.";
+        return false;
+      }
+      std::array<wchar_t, 32768> module_path {};
+      const auto length = GetModuleFileNameW(nullptr, module_path.data(), static_cast<DWORD>(module_path.size()));
+      if (length == 0 || length >= module_path.size()) return false;
+      const auto helper = std::filesystem::path(module_path.data()).parent_path() / "stream-companion" / "StreamCompanion.Windows.exe";
+      if (!std::filesystem::is_regular_file(helper)) {
+        BOOST_LOG(warning) << "Companion blocked launch: runtime bundle missing.";
+        return current_config && !mapped; // No helper ran; no config mutation.
+      }
+      environment["VIBEPOLLO_COMPANION_CLIENT_ID"] = client_uuid;
+      environment["VIBEPOLLO_COMPANION_STEAM_ID"] = account;
+      const auto command = std::string {"\""} + platf::dxgi::wide_to_utf8(helper.wstring()) +
+                           (operation ? std::string {"\" "} + operation : identity_only ? "\" identity-env" : prepare ? "\" prepare-env" : "\" verify-env");
+      boost::filesystem::path working_dir(helper.parent_path().wstring());
+      std::error_code ec;
+      // The helper is not interactive. Retain its bounded structured result
+      // without opening a console or logging account/client environment values.
+      std::unique_ptr<FILE, decltype(&std::fclose)> diagnostics(std::tmpfile(), &std::fclose);
+      if (!diagnostics) {
+        BOOST_LOG(warning) << "Companion diagnostic capture unavailable; preparation not started.";
+        return false;
+      }
+      auto child = platf::run_command(false, false, command, working_dir, environment, diagnostics.get(), ec, nullptr);
+      if (ec) {
+        BOOST_LOG(warning) << "Companion helper startup failed with code [" << ec.value() << ']';
+        return false;
+      }
+      child.wait();
+      BOOST_LOG(info) << "Companion helper exited with code [" << child.exit_code() << ']';
+      std::rewind(diagnostics.get());
+      std::array<char, 4097> output {};
+      const auto bytes = std::fread(output.data(), 1, output.size() - 1, diagnostics.get());
+      if (bytes < output.size() - 1) {
+        const std::string captured(output.data(), bytes);
+        std::smatch status;
+        if (std::regex_search(captured, status, std::regex("\"status\"\\s*:\\s*\"([a-z_]{1,100})\""))) {
+          BOOST_LOG(info) << "Companion result: " << status[1].str();
+        }
+      }
+      if (current_config && !mapped && child.exit_code() == 10) {
+        BOOST_LOG(info) << "Optional current-account configuration safely skipped before mutation.";
+        return true;
+      }
+      if (child.exit_code() != 0) {
+        BOOST_LOG(warning) << "Companion blocked launch: account, game or Cloud evidence not ready.";
+        return false;
+      }
+      std::string current;
+      const bool still_mapped = companion_accounts_enabled() && nvhttp::steam_mapping_for_client(client_uuid, current);
+      return mapped ? still_mapped && current == account : !still_mapped;
+    }
+
+    bool companion_config_gate(const std::string &client_uuid, bp::environment environment,
+                               const ctx_t &app, const rtsp_stream::launch_session_t &session) {
+      // Recovery video never waits for configuration; its session worker retries safely.
+      if (companion_recovery_ui(app) || !companion_steam_app(app)) return true;
+      if (!config::steam.resolution_automation || !companion_runtime_available()) return true;
+      std::string account;
+      const bool mapped = companion_accounts_enabled() && nvhttp::steam_mapping_for_client(client_uuid, account);
+      if (app.steam_id != "275850" && app.steam_id != "1623730") {
+        BOOST_LOG(warning) << "Companion resolution adapter is not live-supported for this Steam app; configuration unchanged.";
+        return true;
+      }
+      if (!app.detached.empty() || app.steam_install_dir.empty()) {
+        BOOST_LOG(warning) << "Companion game preparation requires an installed Steam entry without detached launch commands.";
+        return !mapped;
+      }
+      environment["VIBEPOLLO_COMPANION_APP_ID"] = app.steam_id;
+      environment["VIBEPOLLO_COMPANION_INSTALL"] = app.steam_install_dir;
+      environment["VIBEPOLLO_COMPANION_WIDTH"] = std::to_string(session.width);
+      environment["VIBEPOLLO_COMPANION_HEIGHT"] = std::to_string(session.height);
+      const auto output = session.virtual_display_device_id.empty() ?
+                            session.output_name_override.value_or(config::video.output_name) : session.virtual_display_device_id;
+      const auto gdi_name = VDISPLAY::resolveUsableDisplayName(output);
+      environment["VIBEPOLLO_COMPANION_DISPLAY"] = gdi_name.value_or(std::string {});
+      const auto operation = mapped ? "config-env" : "current-config-env";
+      const bool prepared = companion_account_gate(client_uuid, environment, false, false, operation);
+      if (!mapped && !prepared) BOOST_LOG(warning) << "Optional configuration failed or requires recovery; launch withheld without account selection.";
+      return prepared;
+    }
+#endif
     constexpr const char *LOSSLESS_PROFILE_RECOMMENDED = "recommended";
     constexpr const char *LOSSLESS_PROFILE_CUSTOM = "custom";
     constexpr int LOSSLESS_DEFAULT_FLOW_SCALE = 50;
@@ -1062,7 +1197,9 @@ namespace proc {
       _lossless_last_exe_path(std::move(other._lossless_last_exe_path))
 #endif
   {
+    _state_hook_execution = std::move(other._state_hook_execution);
 #ifdef _WIN32
+    _companion_resolution_stop = std::move(other._companion_resolution_stop);
     _lossless_stop_requested.store(other._lossless_stop_requested.load(std::memory_order_acquire), std::memory_order_release);
     _deferred_launch = other._deferred_launch.load(std::memory_order_acquire);
     _dualsense_ready_deadline = other._dualsense_ready_deadline;
@@ -1081,6 +1218,8 @@ namespace proc {
       _stream_owned_environment_keys = std::move(other._stream_owned_environment_keys);
       _apps = std::move(other._apps);
       _app = std::move(other._app);
+      if (_state_hook_execution) _state_hook_execution->close();
+      _state_hook_execution = std::move(other._state_hook_execution);
       _app_launch_time = other._app_launch_time;
       _active_client_uuid = std::move(other._active_client_uuid);
       _active_client_vdd_identity_token = other._active_client_vdd_identity_token;
@@ -1098,6 +1237,7 @@ namespace proc {
       _app_prep_it = other._app_prep_it;
       _app_prep_begin = other._app_prep_begin;
 #ifdef _WIN32
+      _companion_resolution_stop = std::move(other._companion_resolution_stop);
       if (_runtime_output_override_lease) {
         (void) config::clear_runtime_output_name_override_if_lease(*_runtime_output_override_lease);
       }
@@ -1362,8 +1502,96 @@ namespace proc {
     system_tray::update_tray_playing(_app_name);
 #endif
   }
-  int proc_t::execute(const ctx_t &app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session, bool config_read_gate_held) {
+  nlohmann::json companion_integration_status() {
+    const bool legacy = !config::steam.account_management_configured && nvhttp::has_steam_assignments();
 #ifdef _WIN32
+    constexpr bool supported = true;
+#else
+    constexpr bool supported = false;
+#endif
+    return {{"supported", supported}, {"available", companion_runtime_available()},
+      {"account_management", companion_accounts_enabled()}, {"migration_pending", legacy},
+      {"resolution_automation", config::steam.resolution_automation}};
+  }
+
+  nlohmann::json remembered_steam_accounts() {
+    const nlohmann::json unavailable = {{"status", "unavailable"}, {"accounts", nlohmann::json::array()}};
+    if (!companion_accounts_enabled() || !companion_runtime_available()) return unavailable;
+#ifdef _WIN32
+    static std::mutex listing_mutex;
+    std::unique_lock listing_lock(listing_mutex, std::try_to_lock);
+    if (!listing_lock.owns_lock()) return unavailable;
+    try {
+      std::array<wchar_t, 32768> module {};
+      const auto size = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
+      if (!size || size >= module.size()) return unavailable;
+      const auto helper = std::filesystem::path(module.data()).parent_path() / "stream-companion" / "StreamCompanion.Windows.exe";
+      if (!std::filesystem::is_regular_file(helper)) return unavailable;
+      std::unique_ptr<FILE, decltype(&std::fclose)> output(std::tmpfile(), &std::fclose);
+      if (!output) return unavailable;
+      boost::filesystem::path working_dir(helper.parent_path().wstring());
+      auto environment = bp::this_process::env();
+      std::error_code ec;
+      auto child = platf::run_command(false, false, std::string {"\""} + platf::dxgi::wide_to_utf8(helper.wstring()) + "\" list-accounts", working_dir, environment, output.get(), ec, nullptr);
+      if (ec) return unavailable;
+      // This read-only helper is never allowed to delay streaming or to kill
+      // Steam. A slow helper is detached; only this API request times out.
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (child.running() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      if (child.running()) { child.detach(); return unavailable; }
+      child.wait();
+      if (child.exit_code() != 0) return unavailable;
+      std::rewind(output.get());
+      std::array<char, 65537> bytes {};
+      const auto count = std::fread(bytes.data(), 1, bytes.size(), output.get());
+      if (count >= bytes.size()) return unavailable;
+      const auto parsed = nlohmann::json::parse(bytes.data(), bytes.data() + count);
+      if (!parsed.is_object() || parsed.value("status", "") != "available" || !parsed.contains("accounts") || !parsed["accounts"].is_array() || parsed["accounts"].size() > 64) return unavailable;
+      auto accounts = nlohmann::json::array();
+      std::set<std::string> seen;
+      const auto valid_name = [](const std::string &name, size_t limit) {
+        return name.size() <= limit && std::none_of(name.begin(), name.end(), [](unsigned char c) { return c < 32 || c == 127; });
+      };
+      for (const auto &row : parsed["accounts"]) {
+        if (!row.is_object()) return unavailable;
+        const auto id = row.at("steam_id").get<std::string>();
+        const auto account = row.at("account_name").get<std::string>();
+        const auto persona = row.at("persona_name").get<std::string>();
+        if (id.empty() || !steam_account_policy::valid_assignment(id) || !seen.insert(id).second || account.empty() || !valid_name(account, 256) || !valid_name(persona, 512)) return unavailable;
+        // Project explicitly: unexpected helper fields never cross the API.
+        accounts.push_back({{"steam_id", id}, {"account_name", account}, {"persona_name", persona}});
+      }
+      return {{"status", "available"}, {"accounts", accounts}};
+    } catch (...) { return unavailable; }
+#else
+    return unavailable;
+#endif
+  }
+
+  bool proc_t::check_companion_account(const std::string &client_uuid, bool prepare, bool identity_only, const ctx_t *requested_app) const {
+    // Joining/resuming a stream exposes the recovery UI; it does not launch a game.
+    if (!prepare) return true;
+#ifdef _WIN32
+    return companion_account_gate(client_uuid, _env, prepare, identity_only, nullptr, requested_app && companion_recovery_ui(*requested_app), requested_app && companion_steam_app(*requested_app));
+#else
+    std::string account;
+    return true; // Account automation is unsupported on this platform.
+#endif
+  }
+
+  int proc_t::execute(const ctx_t &app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session, bool config_read_gate_held) {
+    // Serializes account selection through the actual child launch, including
+    // Web UI callers; mapping edits use the same outer lock.
+    std::lock_guard companion_launch_lock(steam_account_policy::launch_mutex());
+#ifdef _WIN32
+    // Check before terminating the previous app or altering display topology.
+    // Selection is based solely on the authenticated session's persisted mapping.
+    const auto companion_client = launch_session ? launch_session->client_uuid : std::string {};
+    std::string companion_account;
+    if (launch_session && !launch_session->input_only && nvhttp::steam_mapping_for_client(companion_client, companion_account) && !companion_account.empty()) {
+      audio::acquire_startup_guard(launch_session->audio_startup_guard);
+    }
+    if (!companion_account_gate(companion_client, _env, true, false, nullptr, companion_recovery_ui(app), companion_steam_app(app))) return 403;
     std::optional<std::filesystem::path> resolved_lossless_exe_path;
     std::string resolved_lossless_exe_utf8;
     _virtual_display_active = false;
@@ -1397,6 +1625,14 @@ namespace proc {
 
     _app = app;
     _app_id = util::from_view(app.id);
+#ifdef _WIN32
+    // Web UI launches bypass NVHTTP display preparation. Capture after the
+    // previous app's termination, before this app can alter display topology.
+    // NVHTTP-prepared launches reuse their already captured shared guard.
+    if (launch_session && !launch_session->input_only) {
+      audio::acquire_startup_guard(launch_session->audio_startup_guard);
+    }
+#endif
     audio::app_started();
 #ifdef _WIN32
     platf::dualsense_usbip_gamepad::set_application_active(true);
@@ -2372,6 +2608,7 @@ namespace proc {
   }
 
   int proc_t::launch_app_commands(bool stream_lifecycle_lock_held, bool config_read_gate_held) {
+    std::lock_guard companion_launch_lock(steam_account_policy::launch_mutex());
     std::error_code ec;
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
@@ -2380,6 +2617,12 @@ namespace proc {
     auto fg = util::fail_guard([&]() {
       terminate(false, true, false, stream_lifecycle_lock_held, config_read_gate_held);
     });
+
+#ifdef _WIN32
+    const auto companion_client = _launch_session ? _launch_session->client_uuid : std::string {};
+    // Deferred launches must revalidate their retained owner before any effects.
+    if (!companion_account_gate(companion_client, _env, false, false, nullptr, companion_recovery_ui(_app), companion_steam_app(_app))) return 403;
+#endif
 
 #ifdef _WIN32
     // Some launchers disable the user's global screen saver setting and may
@@ -2423,6 +2666,14 @@ namespace proc {
                                               find_working_directory(cmd.do_cmd, _env) :
                                               boost::filesystem::path(_app.working_dir);
       BOOST_LOG(info) << "Executing Do Cmd: ["sv << cmd.do_cmd << "] elevated: " << cmd.elevated;
+#ifdef _WIN32
+      if (!companion_account_gate(companion_client, _env, false, true, nullptr, false, companion_steam_app(_app))) {
+        if (!companion_recovery_ui(_app)) return 403;
+        BOOST_LOG(warning) << "Automatic preparation hook withheld until the mapped account is verified; recovery UI remains available.";
+        cmd.undo_cmd.clear(); // This app-instance hook did not run; do not undo it.
+        continue;
+      }
+#endif
       auto child = platf::run_command(cmd.elevated, true, cmd.do_cmd, working_dir, _env, _pipe.get(), ec, nullptr);
 
       if (ec) {
@@ -2449,6 +2700,9 @@ namespace proc {
 
     _env["APOLLO_APP_STATUS"] = "RUNNING";
 
+#ifdef _WIN32
+    if (_launch_session && !companion_config_gate(companion_client, _env, _app, *_launch_session)) return 403;
+#endif
     for (auto &cmd : _app.detached) {
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
                                               find_working_directory(cmd, _env) :
@@ -2466,6 +2720,9 @@ namespace proc {
       }
 #endif
       BOOST_LOG(info) << "Spawning ["sv << cmd << "] in ["sv << working_dir << ']';
+#ifdef _WIN32
+      if (!companion_account_gate(companion_client, _env, false, false, nullptr, companion_recovery_ui(_app), companion_steam_app(_app))) return 403;
+#endif
       auto child = platf::run_command(_app.elevated, true, cmd, working_dir, _env, _pipe.get(), ec, nullptr);
 #ifdef _WIN32
       DWORD detached_pid = 0;
@@ -2558,6 +2815,7 @@ namespace proc {
         cmd += managed_app_focus::launcher_arguments(managed_app_focus::settings);
         std::error_code fec;
         boost::filesystem::path wd;  // empty wd
+        if (!companion_account_gate(companion_client, _env, false, false, nullptr, companion_recovery_ui(_app), companion_steam_app(_app))) return 403;
         _process = platf::run_command(false, true, cmd, wd, _env, _pipe.get(), fec, &_process_group);
         if (fec) {
           BOOST_LOG(warning) << "Playnite helper launch failed: "sv << fec.message() << "; attempting URI fallback"sv;
@@ -2580,6 +2838,7 @@ namespace proc {
         std::string uri = std::string("playnite://playnite/start/") + _app.playnite_id;
         std::error_code fec;
         boost::filesystem::path wd;  // empty working dir as lvalue
+        if (!companion_account_gate(companion_client, _env, false, false, nullptr, companion_recovery_ui(_app), companion_steam_app(_app))) return 403;
         auto child = platf::run_command(false, true, std::string("cmd /c start \"\" \"") + uri + "\"", wd, _env, _pipe.get(), fec, nullptr);
         if (fec) {
           BOOST_LOG(warning) << "Playnite URI launch failed: "sv << fec.message();
@@ -2683,6 +2942,9 @@ namespace proc {
       }
       BOOST_LOG(info) << "Executing: ["sv << _app.cmd << "] in ["sv << working_dir << ']';
       std::string launch_command = _app.cmd;
+#ifdef _WIN32
+      if (!companion_account_gate(companion_client, _env, false, false, nullptr, companion_recovery_ui(_app), companion_steam_app(_app))) return 403;
+#endif
       _process = platf::run_command(_app.elevated, true, launch_command, working_dir, _env, _pipe.get(), ec, &_process_group);
       if (ec) {
         BOOST_LOG(warning) << "Couldn't run ["sv << _app.cmd << "]: System: "sv << ec.message();
@@ -2928,17 +3190,80 @@ namespace proc {
     return _app_id.load(std::memory_order_acquire);
   }
 
-  void proc_t::resume() {
-    BOOST_LOG(info) << "Session resuming for app [" << _app_name << "].";
+  bool proc_t::check_companion_hook(const std::string &client_uuid) const {
+#ifdef _WIN32
+    return companion_account_gate(client_uuid, _env, false, true, nullptr, false, companion_steam_app(_app));
+#else
+    std::string account;
+    return true; // Account automation is unsupported on this platform.
+#endif
+  }
 
 #ifdef _WIN32
+  void proc_t::start_companion_resolution(const std::string &client_uuid, int width, int height) {
+    try {
+    _companion_resolution_stop.reset();
+    if (!config::steam.resolution_automation || !companion_runtime_available()) return;
+    if (!companion_recovery_ui(_app) || client_uuid.empty() || width < 320 || height < 200) return;
+    const auto token = uuid_util::uuid_t::generate().string();
+    const auto name = utf_utils::from_utf8("Local\\Vibepollo.Resolution." + token);
+    HANDLE event = nullptr;
+    HANDLE user = platf::retrieve_users_token(false);
+    if (!user) { BOOST_LOG(warning) << "Resolution preparation deferred: interactive user unavailable."; return; }
+    const auto ec = platf::impersonate_current_user(user, [&]() { event = CreateEventW(nullptr, TRUE, FALSE, name.c_str()); });
+    CloseHandle(user);
+    if (ec || !event) { BOOST_LOG(warning) << "Resolution preparation deferred: session cancellation unavailable."; return; }
+    _companion_resolution_stop = std::shared_ptr<void>(event, [](void *handle) { SetEvent(handle); CloseHandle(handle); });
+    std::array<wchar_t, 32768> module {};
+    const auto size = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
+    if (!size || size >= module.size()) { _companion_resolution_stop.reset(); return; }
+    const auto helper = std::filesystem::path(module.data()).parent_path() / "stream-companion" / "StreamCompanion.Windows.exe";
+    auto environment = _env;
+    std::string account;
+    if (companion_accounts_enabled()) nvhttp::steam_mapping_for_client(client_uuid, account);
+    environment["VIBEPOLLO_COMPANION_CLIENT_ID"] = client_uuid;
+    environment["VIBEPOLLO_COMPANION_STEAM_ID"] = account;
+    environment["VIBEPOLLO_COMPANION_WIDTH"] = std::to_string(width);
+    environment["VIBEPOLLO_COMPANION_HEIGHT"] = std::to_string(height);
+    environment["VIBEPOLLO_COMPANION_RESOLUTION_TOKEN"] = token;
+    HANDLE lifetime = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &lifetime, SYNCHRONIZE, TRUE, 0)) {
+      _companion_resolution_stop.reset(); return;
+    }
+    auto close_lifetime = util::fail_guard([&]() { CloseHandle(lifetime); });
+    environment["VIBEPOLLO_COMPANION_HOST_HANDLE"] = std::to_string(reinterpret_cast<std::uintptr_t>(lifetime));
+    const auto output = _launch_session && !_launch_session->virtual_display_device_id.empty() ? _launch_session->virtual_display_device_id :
+                        _launch_session ? _launch_session->output_name_override.value_or(config::video.output_name) : config::video.output_name;
+    environment["VIBEPOLLO_COMPANION_DISPLAY"] = VDISPLAY::resolveUsableDisplayName(output).value_or(std::string {});
+    boost::filesystem::path working_dir(helper.parent_path().wstring());
+    std::error_code launch_error;
+    auto child = platf::run_command(false, false, std::string {"\""} + platf::dxgi::wide_to_utf8(helper.wstring()) + "\" watch-session-env", working_dir, environment, nullptr, launch_error, nullptr, reinterpret_cast<std::uintptr_t>(lifetime));
+    if (launch_error) { _companion_resolution_stop.reset(); BOOST_LOG(warning) << "Resolution preparation worker unavailable; stream remains accessible."; return; }
+    child.detach();
+    BOOST_LOG(info) << "Deferred resolution preparation started for " << width << 'x' << height << "; results: %LocalAppData%/StreamCompanion/resolution-sessions/.";
+    } catch (...) {
+      _companion_resolution_stop.reset();
+      BOOST_LOG(warning) << "Resolution preparation worker unavailable; stream remains accessible.";
+    }
+  }
+#endif
+
+  void proc_t::resume(const std::string &client_uuid, int stream_width, int stream_height) {
+    BOOST_LOG(info) << "Session resuming for app [" << _app_name << "].";
+    // A pending replacement stream can suppress pause. Carry its outstanding
+    // cleanup into the new owner instead of losing successfully started hooks.
+    auto outstanding = _state_hook_execution ? _state_hook_execution->close() : std::set<std::size_t> {};
+    auto execution = _state_hook_execution = std::make_shared<hook_execution::session>(std::move(outstanding));
+
+#ifdef _WIN32
+    start_companion_resolution(client_uuid, stream_width, stream_height);
     // pause() consumes the prior snapshot after restoring it. Capture a new
     // baseline before any resume command can change the setting again.
     platf::cache_screen_saver_state();
 #endif
 
     if (!_app.state_cmds.empty()) {
-      auto exec_thread = std::thread([cmd_list = _app.state_cmds, app_working_dir = _app.working_dir, _env = _env]() mutable {
+      auto exec_thread = std::thread([cmd_list = _app.state_cmds, app_working_dir = _app.working_dir, _env = _env, client_uuid, execution, steam_managed = companion_steam_app(_app)]() mutable {
         _env["APOLLO_APP_STATUS"] = "RESUMING";
 
         std::error_code ec;
@@ -2956,12 +3281,29 @@ namespace proc {
                                                   find_working_directory(cmd.do_cmd, _env) :
                                                   boost::filesystem::path(app_working_dir);
           BOOST_LOG(info) << "Executing Resume Cmd: ["sv << cmd.do_cmd << "] elevated: " << cmd.elevated;
-          auto child = platf::run_command(cmd.elevated, true, cmd.do_cmd, working_dir, _env, nullptr, ec, nullptr);
+          bp::child child;
+#ifdef _WIN32
+          std::unique_lock account_lock(steam_account_policy::launch_mutex());
+#endif
+          bool started = execution->start(static_cast<std::size_t>(_state_resume_it - cmd_list.begin()), [&]() {
+#ifdef _WIN32
+          if (!companion_account_gate(client_uuid, _env, false, true, nullptr, false, steam_managed)) {
+            BOOST_LOG(warning) << "Automatic resume hook withheld until mapped identity is verified; video remains available.";
+            return false;
+          }
+#endif
+          child = platf::run_command(cmd.elevated, true, cmd.do_cmd, working_dir, _env, nullptr, ec, nullptr);
+          return !ec;
+          });
+#ifdef _WIN32
+          account_lock.unlock();
+#endif
 
           if (ec) {
             BOOST_LOG(error) << "Couldn't run ["sv << cmd.do_cmd << "]: System: "sv << ec.message();
             break;
           }
+          if (!started) continue;
 
           child.wait();
 
@@ -2978,6 +3320,10 @@ namespace proc {
   }
 
   void proc_t::pause(bool stream_lifecycle_lock_held) {
+    auto executed = _state_hook_execution ? _state_hook_execution->close() : std::set<std::size_t> {};
+#ifdef _WIN32
+    _companion_resolution_stop.reset();
+#endif
     const int app_id =
       stream_lifecycle_lock_held ? current_app_id() : running();
     if (app_id <= 0) {
@@ -3010,7 +3356,7 @@ namespace proc {
 #endif
 
     if (!_app.state_cmds.empty()) {
-      auto exec_thread = std::thread([cmd_list = _app.state_cmds, app_working_dir = _app.working_dir, _env = _env, finish_screen_saver_restore]() mutable {
+      auto exec_thread = std::thread([cmd_list = _app.state_cmds, app_working_dir = _app.working_dir, _env = _env, finish_screen_saver_restore, executed = std::move(executed)]() mutable {
         auto restore_guard = util::fail_guard(finish_screen_saver_restore);
         _env["APOLLO_APP_STATUS"] = "PAUSING";
 
@@ -3021,7 +3367,7 @@ namespace proc {
           auto &cmd = *_state_pause_it;
 
           // Skip empty commands
-          if (cmd.undo_cmd.empty()) {
+          if (cmd.undo_cmd.empty() || (!cmd.do_cmd.empty() && !executed.contains(static_cast<std::size_t>(_state_pause_it - cmd_list.begin())))) {
             continue;
           }
 
@@ -3159,6 +3505,13 @@ namespace proc {
       stream_lifecycle_lock =
         std::unique_lock<std::mutex> {nvhttp::stream_lifecycle_mutex()};
     }
+
+    // Resume replaces these owners under the same lifecycle gate. Do not
+    // access their shared pointers before acquiring it during termination.
+    if (_state_hook_execution) _state_hook_execution->close();
+#ifdef _WIN32
+    _companion_resolution_stop.reset();
+#endif
 
     // Stop launch-time focus work before tearing down the application.
     _app_focus.reset();

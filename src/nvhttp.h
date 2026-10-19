@@ -402,4 +402,11 @@ namespace nvhttp {
    * @note Exposed so subsystems (e.g. update) can trigger a save after mutating persisted fields.
    */
   bool save_state();
+
+  // Authenticated host UI assignment only; no password/token handling.
+  bool set_client_steam_account(const std::string &uuid, const std::string &steam_account_id);
+  // Returns this client's nonempty assignment only. Other clients' mappings
+  // never make an unassigned caller require account selection.
+  bool has_steam_assignments();
+  bool steam_mapping_for_client(const std::string &uuid, std::string &account);
 }  // namespace nvhttp

@@ -55,6 +55,19 @@ namespace {
 
 }  // namespace
 
+TEST(RtspStartupSnapshot, RetainsPreDisplayAudioAcrossStartup) {
+  auto source = make_populated_launch_session();
+  auto owner = std::make_shared<int>(1);
+  std::weak_ptr<int> observed = owner;
+  source.audio_startup_guard = owner;
+  owner.reset();
+  auto clone = source.clone_for_startup();
+  source.audio_startup_guard.reset();
+  EXPECT_FALSE(observed.expired());
+  clone.reset();
+  EXPECT_TRUE(observed.expired());
+}
+
 // Guards the exact field that caused Vibepollo #280: a dropped perm leaves the
 // streaming session at PERM::_no, which makes input::passthrough() discard every
 // mouse/keyboard/controller packet while video keeps flowing.

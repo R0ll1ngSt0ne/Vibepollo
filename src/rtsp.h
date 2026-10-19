@@ -44,6 +44,9 @@ namespace rtsp_stream {
     // until the active capture has acquired its own reference. Deliberately
     // omitted from retained app/display-recovery snapshots.
     std::shared_ptr<void> display_power_guard;
+    // Own the pre-display audio snapshot through asynchronous startup. Keep out
+    // of retained display-only recovery records; normal audio lifecycle owns it.
+    std::shared_ptr<void> audio_startup_guard;
     struct resolution_override_t {
       int width;
       int height;

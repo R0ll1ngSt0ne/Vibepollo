@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed, reactive, toRaw, watch } from 'vue';
+import { computed, onMounted, reactive, ref, toRaw, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
+import { apiGet } from '@/api/client';
+
 
 import ClientCommands from '@/components/devices/ClientCommands.vue';
 import SettingsOverrideEditor from '@/components/settings/SettingsOverrideEditor.vue';
@@ -36,6 +38,7 @@ export interface ClientDeviceDraft {
   virtualDisplayMode: ClientVirtualDisplayMode;
   virtualDisplayLayout: ClientVirtualDisplayLayout;
   hdrProfile: string;
+  steamAccountId?: string;
   prefer10BitSdr: boolean;
   configOverrides: Record<string, unknown>;
 }
@@ -104,6 +107,13 @@ function serialized(value: ClientDeviceDraft): string {
 }
 
 const draft = reactive<ClientDeviceDraft>(cloneDraft(props.modelValue));
+const steamManagementEnabled = ref(false);
+onMounted(async () => {
+  try {
+    const status = await apiGet<{ companion?: { supported?: boolean; account_management?: boolean } }>('/api/steam/status');
+    steamManagementEnabled.value = status.companion?.supported === true && status.companion?.account_management === true;
+  } catch { /* Optional integration does not affect device settings. */ }
+});
 let lastSerialized = serialized(props.modelValue);
 
 watch(
@@ -436,6 +446,9 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
             :disabled="busy"
           />
         </SettingRow>
+        <p v-if="steamManagementEnabled">
+          <RouterLink to="/integrations#steam-streaming">Manage Steam account assignments in Integrations</RouterLink>
+        </p>
         <fieldset class="client-permissions">
           <legend>{{ t('ui.devices.editor.permissions_title') }}</legend>
           <p>{{ t('ui.devices.editor.permissions_description') }}</p>

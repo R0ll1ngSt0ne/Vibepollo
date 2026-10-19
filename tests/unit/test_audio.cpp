@@ -15,6 +15,17 @@
 
 using namespace audio::policy;
 
+TEST(AudioRoleSnapshot, PreservesPreDisplayDefaultsAndFillsOnlyMissingRoles) {
+  std::array<std::wstring, 3> captured {L"monitor-before-display-change", L"", L"headset"};
+  const std::array<std::wstring, 3> fallback {L"fallback", L"speakers", L"fallback"};
+  fill_missing_role_snapshot(captured, fallback);
+  EXPECT_EQ(captured[0], L"monitor-before-display-change");
+  EXPECT_EQ(captured[1], L"speakers");
+  EXPECT_EQ(captured[2], L"headset");
+  fill_missing_role_snapshot(captured, fallback);
+  EXPECT_EQ(captured[0], L"monitor-before-display-change");
+}
+
 namespace {
   struct lifecycle_token_t {
     int id {};

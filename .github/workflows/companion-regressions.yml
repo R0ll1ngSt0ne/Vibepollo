@@ -1,0 +1,54 @@
+name: Companion native regressions
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - shell: pwsh
+        run: "'PYTHON_PATH=' + (Split-Path (Get-Command python).Source) >> $env:GITHUB_ENV"
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Native policy and production-source fixtures
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$PYTHON_PATH"):$PATH"
+          compiler="$(cygpath -m "$(command -v g++)")"
+          test_bin_dir="$(cygpath -u "$RUNNER_TEMP")"
+          g++ -std=c++20 -pthread tests/standalone/test_companion_policy.cpp -o "$test_bin_dir/companion-policy"
+          "$test_bin_dir/companion-policy"
+          g++ -std=c++20 tests/standalone/test_companion_integration_policy.cpp -o "$test_bin_dir/integration-policy"
+          "$test_bin_dir/integration-policy"
+          for test in test_launch_admission test_launch_cleanup test_config_routing test_unmapped_passthrough test_resume_account_hooks test_resolution_lifetime test_prep_hook_cleanup test_mapping_transaction; do
+            python "tests/standalone/$test.py" "$compiler"
+          done
+          python tests/unit/test_windows_audio_role_restore.py src/platform/windows/audio.cpp --compiler "$compiler"
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src_assets/common/assets/web
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm run test:unit
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --config playwright.companion.config.ts e2e/devices-diagnostics-parity.spec.ts --grep 'Steam|device editor links'

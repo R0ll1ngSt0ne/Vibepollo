@@ -5,6 +5,11 @@ import { localRoute, expect, test, type Page } from './fixtures';
 const screenshotDirectory = process.env.VIBEPOLLO_TEST_OUTPUT || process.env.VIBESHINE_TEST_OUTPUT || join(tmpdir(), 'vibepollo-ui-results');
 
 type FixtureOptions = {
+  steamAccountsUnavailable?: boolean;
+  steamManagement?: boolean;
+  steamAvailable?: boolean;
+  migrationPending?: boolean;
+  steamAssignment?: string;
   platform?: 'windows' | 'linux' | 'macos';
   vigem?:
     | { status?: unknown; installed?: unknown; required?: unknown; version?: string }
@@ -54,7 +59,7 @@ const devices = [
 
 async function installFixture(page: Page, options: FixtureOptions = {}) {
   const platform = options.platform ?? 'windows';
-  const calls = { vigem: 0 };
+  const calls = { policies: [] as Record<string, unknown>[], accounts: 0, vigem: 0, updates: [] as Record<string, unknown>[] };
 
   await localRoute(page, '**/api/**', async (route) => {
     const request = route.request();
@@ -72,6 +77,9 @@ async function installFixture(page: Page, options: FixtureOptions = {}) {
       body = { locale: 'en' };
     } else if (path === '/api/csrf-token') {
       body = { csrf_token: 'fixture-token' };
+    } else if (path === '/api/config' && request.method() === 'PATCH') {
+      calls.policies.push(request.postDataJSON());
+      body = { status: true, deferred: true };
     } else if (path === '/api/config') {
       body = {
         status: true,
@@ -81,10 +89,12 @@ async function installFixture(page: Page, options: FixtureOptions = {}) {
         virtual_display_layout: 'exclusive',
       };
     } else if (path === '/api/metadata') {
+      if (options.steamAccountsUnavailable) await new Promise(resolve => setTimeout(resolve, 150));
       body = {
         status: true,
         platform,
         version: 'fixture',
+        providers: { steam: true },
         encoder_status: { state: 'ready', h264: true },
         capture_status: {
           configured_backend: 'kms',
@@ -123,7 +133,16 @@ async function installFixture(page: Page, options: FixtureOptions = {}) {
         body = options.vigem ?? { installed: true, version: '1.21.442.0' };
       }
     } else if (path === '/api/clients/list') {
-      body = { status: true, platform, named_certs: devices };
+      body = { status: true, platform, named_certs: devices.map((device) => ({ ...device, steam_account_id: options.steamAssignment ?? '' })) };
+    } else if (path === '/api/steam/status') {
+      body = { enabled: false, available: options.steamAvailable ?? true, companion: { supported: platform === 'windows', available: options.steamAvailable ?? true, account_management: options.steamManagement ?? true, resolution_automation: false, migration_pending: options.migrationPending ?? false } };
+    } else if (path === '/api/clients/steam-accounts') {
+      calls.accounts++;
+      body = options.steamAccountsUnavailable ? { status: 'unavailable', accounts: [] } : {
+        status: 'available', accounts: [{ steam_id: '76561197960265729', account_name: 'fixture-login', persona_name: 'Friendly <name>' }],
+      };
+    } else if (path === '/api/clients/update') {
+      calls.updates.push(request.postDataJSON());
     } else if (path === '/api/clients/hdr-profiles') {
       body = { status: true, profiles: [] };
     } else if (path === '/api/display-devices') {
@@ -138,6 +157,72 @@ async function installFixture(page: Page, options: FixtureOptions = {}) {
 
   return calls;
 }
+
+test('Steam assignment lives in Integrations and preserves identifier text', async ({ page }) => {
+  const calls = await installFixture(page);
+  await page.goto('/v2/integrations');
+  const assignment = page.locator('#steam-assignment-alpha');
+  await expect(assignment).toBeVisible();
+  await expect(assignment.locator('option').nth(1)).toHaveText('Friendly <name> (fixture-login)');
+  await assignment.selectOption('76561197960265729');
+  await assignment.locator('..').getByRole('button', { name: 'Save assignment' }).click();
+  await expect.poll(() => calls.updates.length).toBe(1);
+  expect(calls.updates[0]).toEqual({ uuid: 'alpha', steam_account_id: '76561197960265729' });
+});
+
+test('Steam account list failure preserves assignment until explicitly cleared', async ({ page }) => {
+  const calls = await installFixture(page, { steamAccountsUnavailable: true, steamAssignment: '76561197960265730' });
+  await page.goto('/v2/integrations');
+  const assignment = page.locator('#steam-assignment-alpha');
+  await expect(page.getByText(/Accounts could not be refreshed/)).toBeVisible();
+  await expect(assignment).toHaveValue('76561197960265730');
+  await expect(assignment.locator('option:checked')).toHaveText('Previously assigned account (not currently listed)');
+  expect(calls.updates).toHaveLength(0);
+  await assignment.selectOption('');
+  await assignment.locator('..').getByRole('button', { name: 'Save assignment' }).click();
+  await expect.poll(() => calls.updates.length).toBe(1);
+  expect(calls.updates[0].steam_account_id).toBe('');
+});
+
+for (const scenario of [
+  { name: 'disabled', steamManagement: false },
+  { name: 'absent installation', steamAvailable: false, migrationPending: true, steamAssignment: '76561197960265730' },
+  { name: 'unsupported platform', platform: 'linux' as const },
+]) test(`Steam ${scenario.name} does not fetch remembered accounts`, async ({ page }) => {
+  const calls = await installFixture(page, scenario);
+  await page.goto('/v2/integrations');
+  await expect(page.getByRole('heading', { name: 'Steam streaming automation' })).toBeVisible();
+  if (scenario.name === 'absent installation') {
+    await expect(page.getByText(/Existing assignments were retained/)).toBeVisible();
+    await expect(page.locator('#steam-assignment-alpha')).toHaveValue('76561197960265730');
+  }
+  expect(calls.accounts).toBe(0);
+  expect(calls.updates).toHaveLength(0);
+});
+
+test('Steam automation opt-ins are independent and report deferred application', async ({ page }) => {
+  const calls = await installFixture(page, { steamManagement: false });
+  await page.goto('/v2/integrations');
+  await page.getByRole('checkbox', { name: 'Manage Steam accounts for streaming', exact: true }).check();
+  await expect.poll(() => calls.policies.length).toBe(1);
+  expect(calls.policies[0]).toEqual({ steam_account_management: true });
+  await expect(page.getByText(/Changes take effect after the active session/)).toBeVisible();
+  await page.getByRole('checkbox', { name: 'Adjust supported games to stream resolution', exact: true }).check();
+  await expect.poll(() => calls.policies.length).toBe(2);
+  expect(calls.policies[1]).toEqual({ steam_resolution_automation: true });
+  expect(calls.accounts).toBe(0);
+  expect(calls.updates).toHaveLength(0);
+});
+
+test('device editor links to enabled management without fetching accounts', async ({ page }) => {
+  const calls = await installFixture(page);
+  await page.goto('/v2/devices');
+  await page.locator('#device-search').fill('Living');
+  await page.getByRole('button', { name: 'Edit device' }).click();
+  await expect(page.getByRole('link', { name: 'Manage Steam account assignments in Integrations' })).toBeVisible();
+  expect(calls.accounts).toBe(0);
+  await expect(page.locator('#client-alpha-steam-account')).toHaveCount(0);
+});
 
 test('device filters search display metadata, sort deterministically, and keep drafts hidden by filters', async ({
   page,
