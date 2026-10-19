@@ -44,6 +44,6 @@ int main(){
 with tempfile.TemporaryDirectory(prefix='prep-hook-cleanup-') as directory:
     path=pathlib.Path(directory);cpp=path/'test.cpp';exe=path/'test.exe'
     cpp.write_text(prefix+declarations+body+gate+suffix)
-    subprocess.run([sys.argv[1],'-std=c++20','-I'+str(root/'src'),str(cpp),'-o',str(exe)],check=True)
+    subprocess.run([sys.argv[1],'-std=c++20','-iquote',str(root/'src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True,timeout=15)
 print('Production prep iterator and gate: recovery skip has no setup or undo; admitted hook keeps cleanup; game denial retained PASS')
