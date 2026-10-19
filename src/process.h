@@ -330,8 +330,8 @@ namespace proc {
 #endif
 
     file_t _pipe;
-    std::vector<cmd_t>::iterator _app_prep_it;
-    std::vector<cmd_t>::iterator _app_prep_begin;
+    std::vector<cmd_t>::const_iterator _app_prep_it;
+    std::vector<cmd_t>::const_iterator _app_prep_begin;
 
 #ifdef _WIN32
     void start_lossless_scaling_support(std::unordered_set<DWORD> baseline_pids, const playnite_launcher::lossless::lossless_scaling_app_metadata &metadata, std::string install_dir_hint_utf8, DWORD root_pid);

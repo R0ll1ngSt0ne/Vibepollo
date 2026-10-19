@@ -177,13 +177,6 @@ namespace proc {
       if (!current_config && !mapped) return true;
       // An unavailable verifier must not launch a protected game under an unknown account.
       if (!current_config && !companion_runtime_available()) return false;
-      // Unmapped clients retain upstream admission with no identity/selection
-      // helper. Optional configuration uses only the observed current account.
-      if (!mapped && !current_config) return true;
-      if (mapped && recovery_ui) {
-        if (prepare) BOOST_LOG(info) << "Steam recovery UI allowed; mapped identity will be checked before automatic game launch.";
-        return true;
-      }
       if (client_uuid.empty() || (mapped && account.empty())) {
         BOOST_LOG(warning) << "Companion blocked launch: explicit client account assignment required.";
         return false;
@@ -2674,13 +2667,11 @@ namespace proc {
 #endif
 
     int prep_failure = -1;
-    if (!command_lifetime::prepare(_app_prep_it, _app.prep_cmds.end(), [&](auto &cmd) {
+    if (!command_lifetime::prepare(_app_prep_it, _app.prep_cmds.cend(), [&](const auto &cmd) {
 #ifdef _WIN32
       if (!companion_account_gate(companion_client, _env, false, true, nullptr, false, companion_steam_app(_app))) {
-        if (!companion_recovery_ui(_app)) { prep_failure = 403; return false; }
-        BOOST_LOG(warning) << "Automatic preparation hook withheld until the mapped account is verified; recovery UI remains available.";
-        cmd.undo_cmd.clear(); // This app-instance hook did not run; do not undo it.
-        return true;
+        prep_failure = 403;
+        return false;
       }
 #endif
           boost::filesystem::path working_dir = _app.working_dir.empty() ?
@@ -2831,7 +2822,6 @@ namespace proc {
         cmd += managed_app_focus::launcher_arguments(managed_app_focus::settings);
         std::error_code fec;
         boost::filesystem::path wd;  // empty wd
-        if (!companion_account_gate(companion_client, _env, false, false, nullptr, companion_recovery_ui(_app), companion_steam_app(_app))) return 403;
         _process = platf::run_command(false, true, cmd, wd, _env, _pipe.get(), fec, &_process_group);
         if (fec) {
           BOOST_LOG(warning) << "Playnite helper launch failed: "sv << fec.message() << "; attempting URI fallback"sv;
@@ -2854,7 +2844,6 @@ namespace proc {
         std::string uri = std::string("playnite://playnite/start/") + _app.playnite_id;
         std::error_code fec;
         boost::filesystem::path wd;  // empty working dir as lvalue
-        if (!companion_account_gate(companion_client, _env, false, false, nullptr, companion_recovery_ui(_app), companion_steam_app(_app))) return 403;
         auto child = platf::run_command(false, true, std::string("cmd /c start \"\" \"") + uri + "\"", wd, _env, _pipe.get(), fec, nullptr);
         if (fec) {
           BOOST_LOG(warning) << "Playnite URI launch failed: "sv << fec.message();

@@ -4676,11 +4676,6 @@ namespace nvhttp {
           return;
         }
 
-        if (!proc::proc.check_companion_account(request_client_identity.uuid, false, true)) {
-          tree.put("root.<xmlattr>.status_code", 403);
-          tree.put("root.<xmlattr>.status_message", "Mapped Steam account is not ready");
-          return;
-        }
         const bool no_active_sessions = !has_stream_session_activity();
         const auto runtime_app = proc::proc.resolve_app(
           "0",
@@ -4975,11 +4970,6 @@ namespace nvhttp {
         companion_replacement_admitted = current_appid > 0 && current_appid != proc::input_only_app_id && ((appid > 0 && appid != current_appid) || (!appuuid_str.empty() && appuuid_str != current_app_uuid));
       }
 
-      if (is_input_only && !proc::proc.check_companion_account(request_client_identity.uuid, false, true)) {
-        tree.put("root.<xmlattr>.status_code", 403);
-        tree.put("root.<xmlattr>.status_message", "Mapped Steam account is not ready");
-        return;
-      }
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
 
       bool no_active_sessions =
@@ -5516,12 +5506,6 @@ namespace nvhttp {
       return;
     }
 
-    if (!proc::proc.check_companion_account(request_client_identity.uuid, false, true)) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Mapped Steam account is not ready");
-      return;
-    }
     // proc_t::terminate() leaves the app id at -1 and nothing resets it to 0, so any
     // non-positive id means nothing is running. Comparing against 0 alone would let a
     // stale /resume run the whole resume path for an app that no longer exists.
