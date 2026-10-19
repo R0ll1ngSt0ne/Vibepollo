@@ -6,6 +6,8 @@ a=s.index('  bool proc_t::check_companion_account(');b=s.index('  int proc_t::ex
 s=(root/'src/nvhttp.cpp').read_text();a=s.index('  bool steam_mapping_for_client(');b=s.index('  bool set_client_steam_account(',a);lookup=s[a:b]
 prefix=r'''
 #include <cassert>
+#include <chrono>
+#include <future>
 #include <algorithm>
 #include <cstdio>
 #include <array>
@@ -35,7 +37,7 @@ bool companion_runtime_available(){return runtime_available;}
 bool companion_steam_app(const ctx_t& app){return !app.steam_id.empty()&&app.playnite_id.empty()&&!app.playnite_fullscreen&&app.lutris_id.empty();}
 struct unsupported_proc_t : proc_t {bool check_companion_account(const std::string&,bool,bool,const ctx_t* = nullptr) const;};
 DWORD GetModuleFileNameW(void*,wchar_t* out,DWORD size){++module_calls;auto s=executable.wstring();assert(s.size()<size);std::copy(s.begin(),s.end(),out);return s.size();}
-struct Child {void wait(){}int exit_code(){return exit_status;}};
+struct Child {bool wait_for(std::chrono::seconds){return true;}void terminate(std::error_code&){}void detach(){}int exit_code(){return exit_status;}};
 namespace platf {namespace dxgi {std::string wide_to_utf8(const std::wstring& s){return std::string(s.begin(),s.end());}}
 Child run_command(bool,bool interactive,const std::string& command,const std::filesystem::path&,bp::environment env,void* output,std::error_code&,void*){assert(!interactive&&output);std::fputs("{\"status\":\"account_ready\"}\n",static_cast<FILE*>(output));++helper_calls;selected=env["VIBEPOLLO_COMPANION_STEAM_ID"];command_seen=command;return {};}}
 namespace nvhttp {
@@ -72,6 +74,15 @@ for(auto state:{"stopped","updating","login-needed","wrong-account","remembered-
   assert(companion_account_gate("mapped",{},false,false,nullptr,true));
 }
 assert(helper_calls==before); // No updater interference, account switch, or delay.
+{ // A stalled verifier holds the account lock on another thread; bypass still returns.
+ std::promise<void> acquired,release;auto released=release.get_future();
+ auto blocked=std::async(std::launch::async,[&]{std::lock_guard lock(steam_account_policy::launch_mutex());acquired.set_value();released.wait();});
+ acquired.get_future().wait();
+ auto recovery=std::async(std::launch::async,[&]{return companion_account_gate("mapped",{},true,false,nullptr,true,false);});
+ const bool prompt=recovery.wait_for(std::chrono::seconds(1))==std::future_status::ready;
+ release.set_value();blocked.get();assert(prompt&&recovery.get());
+}
+
 proc_t process;
 assert(process.check_companion_account("mapped",true,false,&ui));
 assert(process.check_companion_account("mapped",false,true,&game));

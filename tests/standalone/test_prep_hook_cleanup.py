@@ -10,6 +10,7 @@ end=source.index('\n#endif',start)
 gate=source[start:end]
 prefix=r'''
 #include <cassert>
+#include "prep_command_lifetime.h"
 #include <sstream>
 #include <string>
 #include <vector>
@@ -27,12 +28,12 @@ struct Host {
 body=r'''
  int prepare(){
  _app_prep_begin=_app.prep_cmds.begin();_app_prep_it=_app_prep_begin;
- for(;_app_prep_it!=_app.prep_cmds.end();++_app_prep_it){
- auto &cmd=*_app_prep_it;
+ int prep_failure=-1;
+ bool completed=proc::command_lifetime::prepare(_app_prep_it,_app.prep_cmds.end(),[&](auto &cmd){
 '''
 suffix=r'''
  ++spawned;
- }return 0;}
+ return true;});return completed?0:prep_failure;}
 };
 int main(){
  Host skipped;assert(skipped.prepare()==0&&skipped.spawned==0&&skipped._app.prep_cmds[0].undo_cmd.empty());
@@ -43,6 +44,6 @@ int main(){
 with tempfile.TemporaryDirectory(prefix='prep-hook-cleanup-') as directory:
     path=pathlib.Path(directory);cpp=path/'test.cpp';exe=path/'test.exe'
     cpp.write_text(prefix+declarations+body+gate+suffix)
-    subprocess.run([sys.argv[1],'-std=c++20',str(cpp),'-o',str(exe)],check=True)
+    subprocess.run([sys.argv[1],'-std=c++20','-I'+str(root/'src'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True,timeout=15)
 print('Production prep iterator and gate: recovery skip has no setup or undo; admitted hook keeps cleanup; game denial retained PASS')

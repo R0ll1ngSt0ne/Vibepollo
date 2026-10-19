@@ -56,6 +56,7 @@
 #include "display_device.h"
 #include "deferred_action.h"
 #include "file_handler.h"
+#include "globals.h"
 #include "logging.h"
 #include "platform/common.h"
 #if defined(_WIN32) || defined(__linux__)
@@ -95,14 +96,17 @@
   #include <sys/syscall.h>
   #include <unistd.h>
 #endif
+#include "builtin_virtual_display.h"
 #include "httpcommon.h"
 #include "nvhttp.h"
+#include "prep_command_lifetime.h"
 #include "process.h"
 #ifdef _WIN32
   #include "platform/windows/virtual_display.h"
   #include "platform/windows/virtual_display_legacy.h"
 #endif
 #include "rtsp.h"
+#include "shutdown_signal.h"
 #include "state_storage.h"
 #include "steam_account_policy.h"
 #include "companion_integration_policy.h"
@@ -162,11 +166,15 @@ namespace proc {
     }
 
     bool companion_account_gate(const std::string &client_uuid, bp::environment environment, bool prepare, bool identity_only = false, const char *operation = nullptr, bool recovery_ui = false, bool steam_managed = true) {
-      std::lock_guard lock(steam_account_policy::launch_mutex());
       std::string account;
-      const bool mapped = companion_accounts_enabled() && nvhttp::steam_mapping_for_client(client_uuid, account);
+      bool mapped = companion_accounts_enabled() && nvhttp::steam_mapping_for_client(client_uuid, account);
       const bool current_config = operation && (std::string_view(operation) == "current-config-env" || std::string_view(operation) == "current-desktop-config-env");
       if (!current_config && (!steam_managed || !mapped || recovery_ui)) return true;
+      std::unique_lock lock(steam_account_policy::launch_mutex(), std::try_to_lock);
+      if (!lock.owns_lock()) return false;
+      account.clear();
+      mapped = companion_accounts_enabled() && nvhttp::steam_mapping_for_client(client_uuid, account);
+      if (!current_config && !mapped) return true;
       // An unavailable verifier must not launch a protected game under an unknown account.
       if (!current_config && !companion_runtime_available()) return false;
       // Unmapped clients retain upstream admission with no identity/selection
@@ -206,7 +214,12 @@ namespace proc {
         BOOST_LOG(warning) << "Companion helper startup failed with code [" << ec.value() << ']';
         return false;
       }
-      child.wait();
+      if (!child.wait_for(std::chrono::seconds(30))) {
+        child.terminate(ec);
+        if (!child.wait_for(std::chrono::seconds(2))) child.detach();
+        BOOST_LOG(warning) << "Companion helper timed out; protected launch withheld.";
+        return false;
+      }
       BOOST_LOG(info) << "Companion helper exited with code [" << child.exit_code() << ']';
       std::rewind(diagnostics.get());
       std::array<char, 4097> output {};
@@ -1582,12 +1595,15 @@ namespace proc {
   int proc_t::execute(const ctx_t &app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session, bool config_read_gate_held) {
     // Serializes account selection through the actual child launch, including
     // Web UI callers; mapping edits use the same outer lock.
-    std::lock_guard companion_launch_lock(steam_account_policy::launch_mutex());
+    std::unique_lock companion_launch_lock(steam_account_policy::launch_mutex(), std::defer_lock);
 #ifdef _WIN32
     // Check before terminating the previous app or altering display topology.
     // Selection is based solely on the authenticated session's persisted mapping.
     const auto companion_client = launch_session ? launch_session->client_uuid : std::string {};
     std::string companion_account;
+    if (companion_steam_app(app)) {
+      if (!companion_launch_lock.try_lock()) return 403;
+    }
     if (launch_session && !launch_session->input_only && nvhttp::steam_mapping_for_client(companion_client, companion_account) && !companion_account.empty()) {
       audio::acquire_startup_guard(launch_session->audio_startup_guard);
     }
@@ -2608,7 +2624,7 @@ namespace proc {
   }
 
   int proc_t::launch_app_commands(bool stream_lifecycle_lock_held, bool config_read_gate_held) {
-    std::lock_guard companion_launch_lock(steam_account_policy::launch_mutex());
+    std::unique_lock companion_launch_lock(steam_account_policy::launch_mutex(), std::defer_lock);
     std::error_code ec;
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
@@ -2620,6 +2636,9 @@ namespace proc {
 
 #ifdef _WIN32
     const auto companion_client = _launch_session ? _launch_session->client_uuid : std::string {};
+    if (companion_steam_app(_app)) {
+      if (!companion_launch_lock.try_lock()) return 403;
+    }
     // Deferred launches must revalidate their retained owner before any effects.
     if (!companion_account_gate(companion_client, _env, false, false, nullptr, companion_recovery_ui(_app), companion_steam_app(_app))) return 403;
 #endif
@@ -2654,48 +2673,45 @@ namespace proc {
     std::string lossless_install_dir_hint;
 #endif
 
-    for (; _app_prep_it != std::end(_app.prep_cmds); ++_app_prep_it) {
-      auto &cmd = *_app_prep_it;
-
-      // Skip empty commands
-      if (cmd.do_cmd.empty()) {
-        continue;
-      }
-
-      boost::filesystem::path working_dir = _app.working_dir.empty() ?
-                                              find_working_directory(cmd.do_cmd, _env) :
-                                              boost::filesystem::path(_app.working_dir);
-      BOOST_LOG(info) << "Executing Do Cmd: ["sv << cmd.do_cmd << "] elevated: " << cmd.elevated;
+    int prep_failure = -1;
+    if (!command_lifetime::prepare(_app_prep_it, _app.prep_cmds.end(), [&](auto &cmd) {
 #ifdef _WIN32
       if (!companion_account_gate(companion_client, _env, false, true, nullptr, false, companion_steam_app(_app))) {
-        if (!companion_recovery_ui(_app)) return 403;
+        if (!companion_recovery_ui(_app)) { prep_failure = 403; return false; }
         BOOST_LOG(warning) << "Automatic preparation hook withheld until the mapped account is verified; recovery UI remains available.";
         cmd.undo_cmd.clear(); // This app-instance hook did not run; do not undo it.
-        continue;
+        return true;
       }
 #endif
-      auto child = platf::run_command(cmd.elevated, true, cmd.do_cmd, working_dir, _env, _pipe.get(), ec, nullptr);
+          boost::filesystem::path working_dir = _app.working_dir.empty() ?
+                                                  find_working_directory(cmd.do_cmd, _env) :
+                                                  boost::filesystem::path(_app.working_dir);
+          BOOST_LOG(info) << "Executing Do Cmd: ["sv << cmd.do_cmd << "] elevated: " << cmd.elevated;
+          auto child = platf::run_command(cmd.elevated, true, cmd.do_cmd, working_dir, _env, _pipe.get(), ec, nullptr);
 
-      if (ec) {
-        BOOST_LOG(error) << "Couldn't run ["sv << cmd.do_cmd << "]: System: "sv << ec.message();
-        // We don't want any prep commands failing launch of the desktop.
-        // This is to prevent the issue where users reboot their PC and need to log in with Sunshine.
-        // permission_denied is typically returned when the user impersonation fails, which can happen when user is not signed in yet.
-        if (!(_app.cmd.empty() && ec == std::errc::permission_denied)) {
-          return -1;
-        }
-      }
+          if (ec) {
+            BOOST_LOG(error) << "Couldn't run ["sv << cmd.do_cmd << "]: System: "sv << ec.message();
+            // We don't want any prep commands failing launch of the desktop.
+            // This is to prevent the issue where users reboot their PC and need to log in with Sunshine.
+            // permission_denied is typically returned when the user impersonation fails, which can happen when user is not signed in yet.
+            if (!(_app.cmd.empty() && ec == std::errc::permission_denied)) {
+              return false;
+            }
+          }
 
-      child.wait(ec);
-      if (ec) {
-        BOOST_LOG(error) << '[' << cmd.do_cmd << "] wait failed with error code ["sv << ec << ']';
-        return -1;
-      }
-      auto ret = child.exit_code();
-      if (ret != 0) {
-        BOOST_LOG(error) << '[' << cmd.do_cmd << "] exited with code ["sv << ret << ']';
-        return -1;
-      }
+          child.wait(ec);
+          if (ec) {
+            BOOST_LOG(error) << '[' << cmd.do_cmd << "] wait failed with error code ["sv << ec << ']';
+            return false;
+          }
+          auto ret = child.exit_code();
+          if (ret != 0) {
+            BOOST_LOG(error) << '[' << cmd.do_cmd << "] exited with code ["sv << ret << ']';
+            return false;
+          }
+          return true;
+        })) {
+      return prep_failure;
     }
 
     _env["APOLLO_APP_STATUS"] = "RUNNING";
@@ -3283,7 +3299,10 @@ namespace proc {
           BOOST_LOG(info) << "Executing Resume Cmd: ["sv << cmd.do_cmd << "] elevated: " << cmd.elevated;
           bp::child child;
 #ifdef _WIN32
-          std::unique_lock account_lock(steam_account_policy::launch_mutex());
+          std::unique_lock account_lock(steam_account_policy::launch_mutex(), std::defer_lock);
+          if (steam_managed) {
+            if (!account_lock.try_lock()) continue;
+          }
 #endif
           bool started = execution->start(static_cast<std::size_t>(_state_resume_it - cmd_list.begin()), [&]() {
 #ifdef _WIN32
@@ -3296,7 +3315,7 @@ namespace proc {
           return !ec;
           });
 #ifdef _WIN32
-          account_lock.unlock();
+          if (account_lock.owns_lock()) account_lock.unlock();
 #endif
 
           if (ec) {
@@ -3613,14 +3632,15 @@ namespace proc {
     const bool has_run = had_active_app;
     const bool should_dispatch_revert = has_run && !proc::proc.get_last_run_app_name().empty();
     const auto undo_timeout = std::max(_app.exit_timeout, std::chrono::seconds(15));
+    const auto shutdown_event = mail::man ? mail::man->event<bool>(mail::shutdown) : nullptr;
+    // SIGINT runs eager app cleanup before publishing mail. Observe the same
+    // cancellation flag as its watchdog without waking main's cleanup early.
+    const auto shutdown_requested = [&shutdown_event]() {
+      return lifetime::shutdown_signal_requested.load(std::memory_order_relaxed) ||
+             (shutdown_event && shutdown_event->peek());
+    };
 
-    for (; _app_prep_it != _app_prep_begin; --_app_prep_it) {
-      auto &cmd = *(_app_prep_it - 1);
-
-      if (cmd.undo_cmd.empty()) {
-        continue;
-      }
-
+    command_lifetime::undo(_app_prep_it, _app_prep_begin, [&](const auto &cmd) {
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
                                               find_working_directory(cmd.undo_cmd, _env) :
                                               boost::filesystem::path(_app.working_dir);
@@ -3630,36 +3650,43 @@ namespace proc {
       if (ec) {
         BOOST_LOG(warning) << "System: "sv << ec.message();
         ec.clear();
-        continue;
+        return;
       }
 
       const auto deadline = std::chrono::steady_clock::now() + undo_timeout;
-      while (child.running() && std::chrono::steady_clock::now() < deadline) {
+      // Undo commands still run during shutdown, but their normal app-stop
+      // timeout can outlast the process shutdown watchdog. Leave a running
+      // command independent so display/audio teardown can finish in time.
+      while (child.running() && !shutdown_requested() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(100ms);
       }
 
       if (child.running()) {
-        BOOST_LOG(warning) << "Undo command timed out after " << undo_timeout.count()
-                           << " seconds; continuing teardown without waiting for completion.";
+        if (shutdown_requested()) {
+          BOOST_LOG(info) << "Process shutdown requested; continuing teardown without waiting for undo command completion.";
+        } else {
+          BOOST_LOG(warning) << "Undo command timed out after " << undo_timeout.count()
+                             << " seconds; continuing teardown without waiting for completion.";
+        }
         try {
           child.detach();
         } catch (...) {
         }
-        continue;
+        return;
       }
 
       child.wait(ec);
       if (ec) {
         BOOST_LOG(warning) << '[' << cmd.undo_cmd << "] wait failed with error code ["sv << ec << ']';
         ec.clear();
-        continue;
+        return;
       }
       auto ret = child.exit_code();
 
       if (ret != 0) {
         BOOST_LOG(warning) << "Return code ["sv << ret << ']';
       }
-    }
+    });
 
 #ifdef _WIN32
     // Restore after terminating the app and running its undo commands so a
@@ -5079,22 +5106,10 @@ namespace proc {
     // Virtual Display entry
 #ifdef _WIN32
     if (vDisplayDriverStatus.load(std::memory_order_acquire) == VDISPLAY::DRIVER_STATUS::OK) {
-      proc::ctx_t ctx {};
+      auto ctx = make_builtin_virtual_display(config::sunshine, [&](const auto &value) {
+        return parse_env_val(this_env, value);
+      });
       ctx.idx = std::to_string(i);
-      ctx.uuid = VIRTUAL_DISPLAY_UUID;
-      ctx.name = "Virtual Display";
-      ctx.image_path = parse_env_val(this_env, "virtual_desktop.png");
-      ctx.virtual_display = true;
-      ctx.scale_factor = 100;
-      ctx.use_app_identity = false;
-      ctx.per_client_app_identity = false;
-      ctx.allow_client_commands = false;
-      ctx.terminate_on_pause = false;
-
-      ctx.elevated = false;
-      ctx.auto_detach = true;
-      ctx.wait_all = false;
-      ctx.exit_timeout = 5s;
 
       auto possible_ids = calculate_app_id(ctx.name, ctx.uuid, ctx.image_path, i++);
       if (ids.count(std::get<0>(possible_ids)) == 0) {

@@ -4,6 +4,19 @@ include("${CMAKE_SOURCE_DIR}/cmake/packaging/windows_virtual_gamepad_contract.cm
 include("${CMAKE_SOURCE_DIR}/cmake/packaging/windows_usbip_contract.cmake")
 
 install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
+set(SUNSHINE_COMPANION_RUNTIME_FILE "" CACHE FILEPATH "Optional verified self-contained streaming companion")
+set(SUNSHINE_COMPANION_RUNTIME_SHA256 "" CACHE STRING "Expected SHA256 of the companion runtime")
+if(SUNSHINE_COMPANION_RUNTIME_FILE)
+    if(NOT EXISTS "${SUNSHINE_COMPANION_RUNTIME_FILE}")
+        message(FATAL_ERROR "Companion runtime is missing")
+    endif()
+    file(SHA256 "${SUNSHINE_COMPANION_RUNTIME_FILE}" _companion_runtime_sha256)
+    if(NOT _companion_runtime_sha256 STREQUAL SUNSHINE_COMPANION_RUNTIME_SHA256)
+        message(FATAL_ERROR "Companion runtime hash does not match the pinned build manifest")
+    endif()
+    install(FILES "${SUNSHINE_COMPANION_RUNTIME_FILE}" DESTINATION "stream-companion"
+            RENAME "StreamCompanion.Windows.exe" COMPONENT application)
+endif()
 install(FILES "${CMAKE_SOURCE_DIR}/packaging/windows/dualsense_usbip_NOTICES.txt"
         DESTINATION "licenses" COMPONENT application)
 
