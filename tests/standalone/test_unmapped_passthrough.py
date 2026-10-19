@@ -37,17 +37,28 @@ bool companion_runtime_available(){return runtime_available;}
 bool companion_steam_app(const ctx_t& app){return !app.steam_id.empty()&&app.playnite_id.empty()&&!app.playnite_fullscreen&&app.lutris_id.empty();}
 struct unsupported_proc_t : proc_t {bool check_companion_account(const std::string&,bool,bool,const ctx_t* = nullptr) const;};
 DWORD GetModuleFileNameW(void*,wchar_t* out,DWORD size){++module_calls;auto s=executable.wstring();assert(s.size()<size);std::copy(s.begin(),s.end(),out);return s.size();}
-bool simulate_timeout=false,termination_fails=false;
-int terminations=0,detachments=0,exit_reads=0;
+using HANDLE=void*;
+constexpr DWORD SYNCHRONIZE=0x100000,PROCESS_TERMINATE=1,WAIT_OBJECT_0=0,WAIT_TIMEOUT=258,WAIT_FAILED=0xffffffff;
+constexpr bool FALSE=false;
+namespace util {template<class F>struct Guard{F f;~Guard(){f();}};template<class F>Guard<F> fail_guard(F f){return {f};}}
+bool simulate_timeout=false,termination_fails=false,open_fails=false,wait_fails=false,signaled=false;
+int terminations=0,detachments=0,exit_reads=0,closes=0,collections=0;
 std::vector<long long> waits;
+HANDLE const own_helper=reinterpret_cast<HANDLE>(123);
+HANDLE OpenProcess(DWORD access,bool inherit,DWORD pid){assert(access==(SYNCHRONIZE|PROCESS_TERMINATE)&&!inherit&&pid==42);signaled=false;return open_fails?nullptr:own_helper;}
+void CloseHandle(HANDLE h){assert(h==own_helper);++closes;}
+DWORD WaitForSingleObject(HANDLE h,DWORD duration){
+ assert(h==own_helper);waits.push_back(duration);
+ if(duration==30000&&(simulate_timeout||wait_fails))return wait_fails?WAIT_FAILED:WAIT_TIMEOUT;
+ if(duration==2000&&termination_fails)return WAIT_TIMEOUT;
+ signaled=true;return WAIT_OBJECT_0;
+}
+bool TerminateProcess(HANDLE h,unsigned code){assert(h==own_helper&&code==1);++terminations;return !termination_fails;}
 struct Child {
- bool wait_for(std::chrono::seconds duration){
-   waits.push_back(duration.count());
-   return !simulate_timeout || (duration==std::chrono::seconds(2)&&!termination_fails);
- }
- void terminate(std::error_code& error){++terminations;if(termination_fails)error=std::make_error_code(std::errc::permission_denied);}
+ DWORD id(){return 42;}
+ void wait(){assert(signaled);++collections;}
  void detach(){++detachments;}
- int exit_code(){++exit_reads;return exit_status;}
+ int exit_code(){assert(signaled);++exit_reads;return exit_status;}
 };
 namespace platf {namespace dxgi {std::string wide_to_utf8(const std::wstring& s){return std::string(s.begin(),s.end());}}
 Child run_command(bool,bool interactive,const std::string& command,const std::filesystem::path&,bp::environment env,void* output,std::error_code&,void*){assert(!interactive&&output);std::fputs("{\"status\":\"account_ready\"}\n",static_cast<FILE*>(output));++helper_calls;selected=env["VIBEPOLLO_COMPANION_STEAM_ID"];command_seen=command;return {};}}
@@ -126,12 +137,12 @@ assert(helper_calls==calls_after_optional);
 // A nominal success exit code must not turn a timed-out helper into admission.
 exit_status=0;simulate_timeout=true;
 for(bool failed:{false,true}) {
- termination_fails=failed;waits.clear();terminations=detachments=exit_reads=0;
+ termination_fails=failed;waits.clear();terminations=detachments=exit_reads=closes=collections=0;
  const auto previous_calls=helper_calls;
  assert(!companion_account_gate("mapped",{},true));
  assert(helper_calls==previous_calls+1);
- assert((waits==std::vector<long long>{30,2}));
- assert(terminations==1&&detachments==(failed?1:0)&&exit_reads==0);
+ assert((waits==std::vector<long long>{30000,2000}));
+ assert(terminations==1&&detachments==(failed?1:0)&&exit_reads==0&&closes==1&&collections==(failed?0:1));
  // Timeout releases the policy lock even when its own helper cannot terminate.
  auto unlocked=std::async(std::launch::async,[]{std::unique_lock lock(steam_account_policy::launch_mutex(),std::try_to_lock);return lock.owns_lock();});
  assert(unlocked.get());
@@ -140,6 +151,15 @@ for(bool failed:{false,true}) {
 }
 simulate_timeout=false;termination_fails=false;
 assert(companion_account_gate("mapped",{},true)); // A later verified attempt can recover.
+open_fails=true;waits.clear();terminations=detachments=closes=collections=exit_reads=0;
+assert(!companion_account_gate("mapped",{},true));
+assert(waits.empty()&&terminations==0&&detachments==1&&closes==0&&collections==0&&exit_reads==0);
+open_fails=false;wait_fails=true;waits.clear();terminations=detachments=closes=collections=exit_reads=0;
+assert(!companion_account_gate("mapped",{},true));
+assert((waits==std::vector<long long>{30000,2000}));
+assert(terminations==1&&detachments==0&&closes==1&&collections==1&&exit_reads==0);
+wait_fails=false;
+assert(companion_account_gate("mapped",{},true));
 }
 '''
 with tempfile.TemporaryDirectory(prefix='unmapped-passthrough-') as d:

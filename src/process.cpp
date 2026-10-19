@@ -88,7 +88,6 @@
   #include "platform/linux/secure_open.h"
   #include "platform/linux/smooth_motion_policy.h"
   #include "platform/linux/wayland_hdr_compatibility.h"
-  #include "steam_integration.h"
 
   #include <fcntl.h>
   #include <linux/openat2.h>
@@ -109,6 +108,7 @@
 #include "shutdown_signal.h"
 #include "state_storage.h"
 #include "steam_account_policy.h"
+#include "steam_integration.h"
 #include "companion_integration_policy.h"
 #include "config_steam.h"
 #include "stream.h"
@@ -207,12 +207,22 @@ namespace proc {
         BOOST_LOG(warning) << "Companion helper startup failed with code [" << ec.value() << ']';
         return false;
       }
-      if (!child.wait_for(std::chrono::seconds(30))) {
-        child.terminate(ec);
-        if (!child.wait_for(std::chrono::seconds(2))) child.detach();
-        BOOST_LOG(warning) << "Companion helper timed out; protected launch withheld.";
+      HANDLE helper_process = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, child.id());
+      if (!helper_process) {
+        child.detach();
+        BOOST_LOG(warning) << "Companion helper process handle unavailable; protected launch withheld.";
         return false;
       }
+      auto close_helper = util::fail_guard([&]() { CloseHandle(helper_process); });
+      if (WaitForSingleObject(helper_process, 30000) != WAIT_OBJECT_0) {
+        // Own helper only: a process group may also contain Steam itself.
+        TerminateProcess(helper_process, 1);
+        if (WaitForSingleObject(helper_process, 2000) == WAIT_OBJECT_0) child.wait();
+        else child.detach();
+        BOOST_LOG(warning) << "Companion helper timed out or wait failed; protected launch withheld.";
+        return false;
+      }
+      child.wait(); // Signaled process: collect the exit code without an unbounded wait.
       BOOST_LOG(info) << "Companion helper exited with code [" << child.exit_code() << ']';
       std::rewind(diagnostics.get());
       std::array<char, 4097> output {};
