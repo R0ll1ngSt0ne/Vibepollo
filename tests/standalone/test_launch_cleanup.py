@@ -33,12 +33,14 @@ return 0;}
 void cleared(const proc_t& p){assert(p.app_id==0&&!p._launch_session&&!p.audio&&!p.display);}
 int main(){proc_t immediate;assert(immediate.launch_app_commands(true,true)==403);cleared(immediate);
 proc_t deferred;deferred.deferred=true;deferred.deferred=false;assert(deferred.launch_app_commands(true,false)==403);cleared(deferred);
-// Account/mapping transition owns the same lock. Deferred verification cannot
-// observe the former identity while a transition is still in progress.
+// A contended account/mapping transition rejects without observing an identity.
+// Keep the lock until the worker returns so scheduling cannot change the case.
 proc_t raced;std::unique_lock gate(steam_account_policy::launch_mutex());int before=observations;
-std::atomic<bool> launched=false;std::thread worker([&]{launched=true;assert(raced.launch_app_commands(true,false)==403);});
-while(!launched.load())std::this_thread::yield();assert(observations==before);
-ready=false;gate.unlock();worker.join();cleared(raced);assert(observations==before+1);
+std::thread worker([&]{assert(raced.launch_app_commands(true,false)==403);});
+worker.join();cleared(raced);assert(observations==before);
+gate.unlock();
+// After the transition releases the lock, a new launch revalidates the owner.
+proc_t retry;assert(retry.launch_app_commands(true,false)==403);cleared(retry);assert(observations==before+1);
 }
 """
 with tempfile.TemporaryDirectory(prefix='launch-cleanup-') as d:
