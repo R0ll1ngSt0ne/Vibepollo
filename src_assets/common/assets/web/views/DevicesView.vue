@@ -39,6 +39,7 @@ interface PairedDevice {
   undo?: Array<{ cmd?: string; elevated?: boolean }>;
   last_seen?: number | string | null;
   hdr_profile?: string | null;
+  steam_account_id?: string;
   display_mode?: string;
   output_name_override?: string;
   virtual_display_mode?: string;
@@ -181,6 +182,7 @@ function normalizeDevice(device: unknown, index: number): PairedDevice {
     last_seen:
       typeof raw.last_seen === 'number' || typeof raw.last_seen === 'string' ? raw.last_seen : null,
     hdr_profile: stringValue(raw.hdr_profile) || null,
+    steam_account_id: stringValue(raw.steam_account_id),
     display_mode: stringValue(raw.display_mode),
     output_name_override: stringValue(raw.output_name_override),
     virtual_display_mode: stringValue(raw.virtual_display_mode),
@@ -213,6 +215,7 @@ function searchableDeviceText(device: PairedDevice): string {
     stringValue(device.uuid),
     stringValue(device.display_mode),
     stringValue(device.hdr_profile),
+    stringValue(device.steam_account_id),
     stringValue(device.output_name_override),
     displayRoutingLabel(device),
     device.connected ? t('clients.connected') : t('clients.offline'),
@@ -390,6 +393,7 @@ function draftFromDevice(device: PairedDevice): ClientDeviceDraft {
     virtualDisplayMode,
     virtualDisplayLayout,
     hdrProfile: device.hdr_profile?.trim() ?? '',
+    steamAccountId: device.steam_account_id ?? '',
     prefer10BitSdr: Boolean(device.prefer_10bit_sdr),
     configOverrides:
       device.config_overrides && typeof device.config_overrides === 'object'
@@ -632,6 +636,7 @@ const draftScalarKeys = [
   'virtualDisplayMode',
   'virtualDisplayLayout',
   'hdrProfile',
+  'steamAccountId',
   'prefer10BitSdr',
 ] as const satisfies ReadonlyArray<Exclude<keyof ClientDeviceDraft, 'configOverrides'>>;
 

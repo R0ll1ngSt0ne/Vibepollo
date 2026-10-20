@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "config_steam.h"
+#include "process.h"
 #include "confighttp.h"
 #include "file_handler.h"
 #include "platform/common.h"
@@ -81,6 +82,7 @@ namespace confighttp {
 #else
       out["playnite_available"] = true;
 #endif
+      out["companion"] = proc::companion_integration_status();
       send_response(response, out);
     } catch (const std::exception &error) {
       bad_request(response, request, error.what());

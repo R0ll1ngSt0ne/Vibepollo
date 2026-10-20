@@ -79,3 +79,24 @@ TEST(SteamConfig, ParsesRecentSynchronizationPolicy) {
   vars = {{"steam_recent_games", "-1"}};
   EXPECT_EQ(config::parse_steam(vars).recent_games, 10);
 }
+
+TEST(SteamConfig, AccountAndResolutionAutomationAreIndependentOptIns) {
+  std::unordered_map<std::string, std::string> defaults;
+  const auto fresh = config::parse_steam(defaults);
+  EXPECT_FALSE(fresh.account_management_configured);
+  EXPECT_FALSE(fresh.account_management);
+  EXPECT_FALSE(fresh.resolution_automation);
+  const auto linux_policy = config::normalize_steam_policy(fresh, true);
+  EXPECT_TRUE(linux_policy.enabled);
+  EXPECT_FALSE(linux_policy.account_management);
+  EXPECT_FALSE(linux_policy.resolution_automation);
+  std::unordered_map<std::string, std::string> vars {
+    {"steam_enabled", "off"}, {"steam_account_management", "off"},
+    {"steam_resolution_automation", "on"},
+  };
+  const auto explicit_policy = config::parse_steam(vars);
+  EXPECT_TRUE(explicit_policy.account_management_configured);
+  EXPECT_FALSE(explicit_policy.account_management);
+  EXPECT_TRUE(explicit_policy.resolution_automation);
+  EXPECT_TRUE(vars.empty());
+}

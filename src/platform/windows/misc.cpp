@@ -1026,7 +1026,7 @@ namespace platf {
    * @param ec A reference to a `std::error_code` object that will store any error that occurred during the creation of the structure.
    * @return A structure that contains information about how to launch the new process.
    */
-  STARTUPINFOEXW create_startup_info(FILE *file, HANDLE *job, std::error_code &ec) {
+  STARTUPINFOEXW create_startup_info(FILE *file, HANDLE *job, std::error_code &ec, HANDLE *lifetime) {
     // Initialize a zeroed-out STARTUPINFOEXW structure and set its size
     STARTUPINFOEXW startup_info = {};
     startup_info.StartupInfo.cb = sizeof(startup_info);
@@ -1063,6 +1063,13 @@ namespace platf {
       // Note: The value we point to here must be valid for the lifetime of the attribute list,
       // so we take a HANDLE* instead of just a HANDLE to use the caller's stack storage.
       UpdateProcThreadAttribute(startup_info.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, job, sizeof(*job), nullptr, nullptr);
+    }
+    if (lifetime) {
+      // The dedicated resolution worker inherits exactly one SYNCHRONIZE-only
+      // host handle. It cannot query memory, modify or terminate the host.
+      if (file || !UpdateProcThreadAttribute(startup_info.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, lifetime, sizeof(*lifetime), nullptr, nullptr)) {
+        ec = std::make_error_code(std::errc::invalid_argument);
+      }
     }
 
     return startup_info;
@@ -1476,10 +1483,11 @@ namespace platf {
    * @param group A pointer to a `bp::group` object to which the new process should belong (may be `nullptr`).
    * @return A `bp::child` object representing the new process, or an empty `bp::child` object if the launch fails.
    */
-  bp::child run_command(bool elevated, bool interactive, const std::string &cmd, boost::filesystem::path &working_dir, const bp::environment &env, FILE *file, std::error_code &ec, bp::group *group) {
+  bp::child run_command(bool elevated, bool interactive, const std::string &cmd, boost::filesystem::path &working_dir, const bp::environment &env, FILE *file, std::error_code &ec, bp::group *group, std::uintptr_t inherited_lifetime) {
     std::wstring start_dir = utf_utils::from_utf8(working_dir.string());
     HANDLE job = group ? group->native_handle() : nullptr;
-    STARTUPINFOEXW startup_info = create_startup_info(file, job ? &job : nullptr, ec);
+    HANDLE lifetime = reinterpret_cast<HANDLE>(inherited_lifetime);
+    STARTUPINFOEXW startup_info = create_startup_info(file, job ? &job : nullptr, ec, lifetime ? &lifetime : nullptr);
     PROCESS_INFORMATION process_info;
 
     // Clone the environment to create a local copy. Boost.Process (bp) shares the environment with all spawned processes.
@@ -1489,6 +1497,7 @@ namespace platf {
 
     if (ec) {
       // In the event that startup_info failed, return a blank child process.
+      if (startup_info.lpAttributeList) free_proc_thread_attr_list(startup_info.lpAttributeList);
       return bp::child();
     }
 
@@ -1553,7 +1562,7 @@ namespace platf {
       ec = impersonate_current_user(user_token, [&]() {
         std::wstring env_block = create_environment_block(cloned_env);
         std::wstring wcmd = resolve_command_string(cmd, start_dir, user_token, creation_flags);
-        ret = CreateProcessAsUserW(user_token, nullptr, (LPWSTR) wcmd.c_str(), nullptr, nullptr, !!(startup_info.StartupInfo.dwFlags & STARTF_USESTDHANDLES), creation_flags, env_block.data(), start_dir.empty() ? nullptr : start_dir.c_str(), (LPSTARTUPINFOW) &startup_info, &process_info);
+        ret = CreateProcessAsUserW(user_token, nullptr, (LPWSTR) wcmd.c_str(), nullptr, nullptr, !!(startup_info.StartupInfo.dwFlags & STARTF_USESTDHANDLES) || lifetime != nullptr, creation_flags, env_block.data(), start_dir.empty() ? nullptr : start_dir.c_str(), (LPSTARTUPINFOW) &startup_info, &process_info);
       });
     }
     // Otherwise, launch the process using CreateProcessW()
@@ -1577,7 +1586,7 @@ namespace platf {
 
       std::wstring env_block = create_environment_block(cloned_env);
       std::wstring wcmd = resolve_command_string(cmd, start_dir, nullptr, creation_flags);
-      ret = CreateProcessW(nullptr, (LPWSTR) wcmd.c_str(), nullptr, nullptr, !!(startup_info.StartupInfo.dwFlags & STARTF_USESTDHANDLES), creation_flags, env_block.data(), start_dir.empty() ? nullptr : start_dir.c_str(), (LPSTARTUPINFOW) &startup_info, &process_info);
+      ret = CreateProcessW(nullptr, (LPWSTR) wcmd.c_str(), nullptr, nullptr, !!(startup_info.StartupInfo.dwFlags & STARTF_USESTDHANDLES) || lifetime != nullptr, creation_flags, env_block.data(), start_dir.empty() ? nullptr : start_dir.c_str(), (LPSTARTUPINFOW) &startup_info, &process_info);
     }
 
     // Use the results of the launch to create a bp::child object

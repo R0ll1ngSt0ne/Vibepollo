@@ -712,6 +712,7 @@ sunshine_register_component(NAME test_component_host_stats TEST_SOURCE unit/test
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/host_stats_service.cpp")
 sunshine_register_component(NAME test_component_audio_policy TEST_SOURCE unit/test_audio.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/audio_policy.cpp")
+sunshine_register_component(NAME test_component_steam_account_policy TEST_SOURCE unit/test_steam_account_policy.cpp)
 sunshine_register_component(NAME test_component_mouse_policy TEST_SOURCE unit/test_mouse.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/mouse_input.cpp")
 sunshine_register_component(NAME test_component_platform_common TEST_SOURCE unit/platform/test_common.cpp
@@ -1629,4 +1630,9 @@ if(Python3_Interpreter_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 --compiler "${CMAKE_CXX_COMPILER}" --node "${SUNSHINE_TEST_FOCUS_NODE}")
         set_tests_properties(regression_managed_app_focus_adapters PROPERTIES LABELS "component" TIMEOUT 60)
     endif()
+endif()
+
+if(SUNSHINE_TEST_PYTHON_EXECUTABLE)
+add_test(NAME regression_audio_topology COMMAND "${SUNSHINE_TEST_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/unit/test_audio_topology.py" "${CMAKE_CXX_COMPILER}")
+set_tests_properties(regression_audio_topology PROPERTIES TIMEOUT 120)
 endif()

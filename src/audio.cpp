@@ -310,11 +310,12 @@ namespace audio {
     return context_manager().acquire();
   }
 
-  std::shared_ptr<void> capture_before_display_change(bool input_only) {
+  std::shared_ptr<void> capture_before_display_change(bool input_only, bool topology_only) {
 #ifdef _WIN32
-    return context_manager().before_display_change(config::audio.stream, input_only);
+    return context_manager().before_display_change(config::audio.stream || topology_only, input_only);
 #else
     (void) input_only;
+    (void) topology_only;
     return {};
 #endif
   }

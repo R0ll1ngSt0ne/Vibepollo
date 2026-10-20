@@ -127,7 +127,7 @@ namespace platf {
    * @param ec A reference to a `std::error_code` object that will store any error that occurred during the creation of the structure.
    * @return A structure that contains information about how to launch the new process.
    */
-  STARTUPINFOEXW create_startup_info(FILE *file, HANDLE *job, std::error_code &ec);
+  STARTUPINFOEXW create_startup_info(FILE *file, HANDLE *job, std::error_code &ec, HANDLE *lifetime = nullptr);
 
   /**
    * @brief Free the attribute list allocated in create_startup_info.

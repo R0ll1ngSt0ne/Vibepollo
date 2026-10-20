@@ -92,6 +92,7 @@ namespace audio {
 
   void context_manager_t::stop(audio_ctx_t &ctx) {
     if (!ctx.restore_sink) {
+      if (ctx.control) ctx.control->restore_topology_snapshot();
       return;
     }
     if (environment_.retain_for_app && lifecycle::final_owner_release_action(ctx.restore_sink, environment_.app_active(), state_.terminal_pending()) == lifecycle::release_action_e::retain) {

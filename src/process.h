@@ -5,6 +5,7 @@
 #pragma once
 #include "managed_app_focus.h"
 #include "process_catalog.h"
+#include "hook_execution.h"
 
 #ifndef __kernel_entry
   #define __kernel_entry
@@ -53,6 +54,8 @@ namespace bp = boost_process_shim;
 #define DEFAULT_APP_IMAGE_PATH SUNSHINE_ASSETS_DIR "/box.png"
 
 namespace proc {
+  nlohmann::json companion_integration_status();
+  nlohmann::json remembered_steam_accounts();
   using file_t = util::safe_ptr_v2<FILE, int, fclose>;
 
 #ifdef _WIN32
@@ -113,6 +116,7 @@ namespace proc {
 
     // Callers holding the configuration read gate must defer cleanup writes.
     int execute(const ctx_t &_app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session, bool config_read_gate_held = false);
+    bool check_companion_account(const std::string &client_uuid, bool prepare, bool identity_only = false, const ctx_t *requested_app = nullptr) const;
 
     /**
      * @return `_app_id` if a process is running, otherwise returns `0`
@@ -135,7 +139,8 @@ namespace proc {
     std::string get_last_run_app_name();
     std::string get_running_app_uuid();
     bp::environment get_env();
-    void resume();
+    void resume(const std::string &client_uuid, int stream_width, int stream_height);
+    bool check_companion_hook(const std::string &client_uuid) const;
     void pause(bool stream_lifecycle_lock_held = false);
     void terminate(
       bool immediate = false,
@@ -185,6 +190,7 @@ namespace proc {
     std::unordered_set<std::string> _stream_owned_environment_keys;
     std::vector<ctx_t> _apps;
     ctx_t _app;
+    std::shared_ptr<hook_execution::session> _state_hook_execution;
     std::chrono::steady_clock::time_point _app_launch_time;
     std::string _active_client_uuid;
     std::uint64_t _active_client_vdd_identity_token {0};
@@ -203,6 +209,8 @@ namespace proc {
     std::chrono::steady_clock::time_point _steam_last_tracking_poll {};
 
 #ifdef _WIN32
+    std::shared_ptr<void> _companion_resolution_stop;
+    void start_companion_resolution(const std::string &client_uuid, int width, int height);
     std::atomic_bool _deferred_launch {false};
     std::chrono::steady_clock::time_point _dualsense_ready_deadline {};
     bool _lossless_should_start_support {false};

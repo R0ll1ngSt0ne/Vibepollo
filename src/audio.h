@@ -84,7 +84,7 @@ namespace audio {
   audio_ctx_ref_t get_audio_ctx_ref();
 
   /** @brief Hold pre-display audio state; native routing remains deferred to capture. */
-  std::shared_ptr<void> capture_before_display_change(bool input_only = false);
+  std::shared_ptr<void> capture_before_display_change(bool input_only = false, bool topology_only = false);
 
   /** @brief Mark the current app as terminal and restore retained audio state. */
   void app_termination_requested();

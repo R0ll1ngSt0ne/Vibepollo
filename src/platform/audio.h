@@ -42,6 +42,9 @@ namespace platf {
 
   class audio_control_t {
   public:
+    // Recover observed display displacement when capture never assigned a sink.
+    virtual void restore_topology_snapshot() {}
+
     virtual int set_sink(const std::string &sink) = 0;
 
     // Select a loopback endpoint without changing system routing, when supported.

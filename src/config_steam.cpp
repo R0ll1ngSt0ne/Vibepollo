@@ -117,6 +117,9 @@ namespace config {
   steam_t parse_steam(std::unordered_map<std::string, std::string> &vars) {
     steam_t result;
     consume(vars, "steam_enabled", result.enabled);
+    result.account_management_configured = vars.contains("steam_account_management");
+    consume(vars, "steam_account_management", result.account_management);
+    consume(vars, "steam_resolution_automation", result.resolution_automation);
     consume(vars, "steam_auto_sync", result.auto_sync);
     consume(vars, "steam_sync_all_installed", result.sync_all_installed);
     consume(vars, "steam_recent_games", result.recent_games);

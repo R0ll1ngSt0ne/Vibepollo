@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import SteamStreamingSettings, { type StreamingStatus } from '@/components/settings/SteamStreamingSettings.vue';
 import { providerSupported } from '@/utils/providerCapabilities';
 import GameLibrarySetup from '../../web-legacy/components/GameLibrarySetup.vue';
 import { useUnsavedChanges } from '@/composables/useUnsavedChanges';
@@ -34,6 +35,7 @@ interface PlayniteStatus {
 }
 
 interface SteamStatus {
+  companion?: StreamingStatus;
   enabled?: boolean;
   forced?: boolean;
   available?: boolean;
@@ -1273,6 +1275,14 @@ watch(
     document.getElementById(route.hash.slice(1))?.scrollIntoView({ block: 'start' });
   },
 );
+// Authentication can finish before background capability discovery. Retry once
+// capabilities arrive rather than leaving optional Steam controls unavailable.
+watch(
+  () => [providerSupported(system.metadata, 'steam'), refreshing.value] as const,
+  ([supported, busy]) => {
+    if (supported && !busy && !steam.value && !errors.value.steam) void load(true);
+  },
+);
 onMounted(() => void load());
 const librarySetupOpen = ref(false);
 function libraryRequest(
@@ -1884,6 +1894,7 @@ function libraryRequest(
               </div>
             </div>
           </section>
+          <SteamStreamingSettings v-if="summary.id === 'steam' && steam?.companion" :status="steam.companion" @changed="load(true)" />
         </div>
         <div v-if="summary.id === 'steam' || summary.id === 'lutris' || isWindows" class="integration-row__actions">
           <template v-if="summary.id === 'steam'">

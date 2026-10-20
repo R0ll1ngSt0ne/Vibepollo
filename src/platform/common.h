@@ -720,7 +720,11 @@ namespace platf {
 
   namespace bp = boost_process_shim;
 
-  bp::child run_command(bool elevated, bool interactive, const std::string &cmd, boost::filesystem::path &working_dir, const bp::environment &env, FILE *file, std::error_code &ec, bp::group *group);
+  bp::child run_command(bool elevated, bool interactive, const std::string &cmd, boost::filesystem::path &working_dir, const bp::environment &env, FILE *file, std::error_code &ec, bp::group *group
+#ifdef _WIN32
+                        , std::uintptr_t inherited_lifetime = 0
+#endif
+  );
 
   enum class thread_priority_e : int {
     low,  ///< Low priority

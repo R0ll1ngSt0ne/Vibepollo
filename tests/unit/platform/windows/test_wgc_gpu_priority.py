@@ -56,7 +56,9 @@ using HANDLE = void *;
 using HMODULE = void *;
 using DPI_AWARENESS_CONTEXT = void *;
 #define WINAPI
+#ifndef __stdcall
 #define __stdcall
+#endif
 #define SUCCEEDED(status) ((status) >= 0)
 #define FAILED(status) ((status) < 0)
 #define BOOST_LOG(level) log_output
