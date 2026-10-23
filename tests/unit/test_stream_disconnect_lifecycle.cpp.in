@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -129,10 +130,18 @@ namespace input {
 }
 
 namespace proc {
+  // Pause now closes preparation hooks and releases the resolution worker.
+  // Their lifecycle is covered separately; this fixture isolates disconnect
+  // delivery and pause/terminate admission without starting real workers.
+  struct state_hook_execution_stub_t {
+    std::set<std::size_t> close() { return {}; }
+  };
   struct proc_t {
     int app_id = 42;
     int terminations = 0;
     int pause_continued = 0;
+    std::shared_ptr<state_hook_execution_stub_t> _state_hook_execution;
+    std::shared_ptr<int> _companion_resolution_stop;
     struct { bool terminate_on_pause = false; } _app;
     std::string _app_name = "retained game";
     int current_app_id() { return app_id; }

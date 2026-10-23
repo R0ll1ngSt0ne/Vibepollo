@@ -2,6 +2,11 @@
  * @file src/nvenc/nvenc_d3d11.cpp
  * @brief Definitions for abstract Direct3D11 NVENC encoder.
  */
+// platform includes
+#ifdef _WIN32
+  #include <winsock2.h>
+#endif
+
 // local includes
 #include "src/logging.h"
 

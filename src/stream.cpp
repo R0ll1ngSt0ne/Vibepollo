@@ -59,6 +59,7 @@ extern "C" {
 #include "rtsp.h"
 #include "rtsp_pending_policy.h"
 #include "session_history.h"
+#include "steam_account_policy.h"
 #include "stream.h"
 #include "stream_broadcast_runtime.h"
 #include "sync.h"
@@ -693,6 +694,7 @@ namespace stream {
 
     std::list<crypto::command_entry_t> do_cmds;
     std::list<crypto::command_entry_t> undo_cmds;
+    std::shared_ptr<hook_execution::client_session> hook_state = std::make_shared<hook_execution::client_session>();
 
     safe::mail_raw_t::event_t<bool> shutdown_event;
     safe::signal_t controlEnd;
@@ -3650,7 +3652,8 @@ namespace stream {
       }
       // Snapshot the app environment before pause or finalization can change it.
 
-      if (!session.undo_cmds.empty()) {
+      auto executed_hooks = session.hook_state->close();
+      if (executed_hooks && !session.undo_cmds.empty()) {
         auto exec_thread = std::thread([cmd_list = session.undo_cmds, env = proc::proc.get_env()]() mutable {
           for (auto &cmd : cmd_list) {
             std::error_code ec;
@@ -3982,20 +3985,36 @@ namespace stream {
         }
 #endif
         if (first_rtsp_session) {
-          proc::proc.resume();
+          proc::proc.resume(session.device_uuid, session.config.monitor.width, session.config.monitor.height);
         }
       }
 
       if (!session.do_cmds.empty()) {
-        auto exec_thread = std::thread([cmd_list = session.do_cmds, env = proc::proc.get_env()]() mutable {
+        auto exec_thread = std::thread([cmd_list = session.do_cmds, env = proc::proc.get_env(), client_uuid = session.device_uuid, execution = session.hook_state]() mutable {
           for (auto &cmd : cmd_list) {
             std::error_code ec;
             boost::filesystem::path working_dir = proc::find_working_directory(cmd.cmd, env);
-            auto child = platf::run_command(cmd.elevated, true, cmd.cmd, working_dir, env, nullptr, ec, nullptr);
+            platf::bp::child child;
+#ifdef _WIN32
+            std::unique_lock account_lock(steam_account_policy::launch_mutex());
+#endif
+            bool started = execution->start([&]() {
+#ifdef _WIN32
+            if (!proc::proc.check_companion_hook(client_uuid)) {
+              BOOST_LOG(warning) << "Automatic client hook withheld until mapped identity is verified; video remains available.";
+              return hook_execution::start_result::gated;
+            }
+#endif
+            child = platf::run_command(cmd.elevated, true, cmd.cmd, working_dir, env, nullptr, ec, nullptr);
+            return ec ? hook_execution::start_result::failed : hook_execution::start_result::started;
+            });
+#ifdef _WIN32
+            account_lock.unlock();
+#endif
             BOOST_LOG(info) << "Spawning client do command ["sv << cmd.cmd << "] in ["sv << working_dir << ']';
             if (ec) {
               BOOST_LOG(warning) << "Couldn't spawn ["sv << cmd.cmd << "]: System: "sv << ec.message();
-            } else {
+            } else if (started) {
               child.detach();
             }
           }

@@ -32,6 +32,7 @@
 // local includes
 #include "audio_visibility_recovery.h"
 #include "src/audio_role_control.h"
+#include "src/audio_topology_policy.h"
 #include "src/config.h"
 #include "src/globals.h"
 #include "src/logging.h"
@@ -618,6 +619,69 @@ namespace platf::audio {
     std::atomic_bool default_render_device_changed_flag;
   };
 
+  class topology_notification_t: public audio_notification_t {
+  public:
+    using snapshot_t = ::audio::policy::topology_snapshot_t<std::wstring, ERole_enum_count>;
+    using revision_t = std::array<std::uint64_t, ERole_enum_count>;
+
+    void capture(const role_device_ids_t &ids) {
+      std::scoped_lock lock(mutex);
+      snapshot.capture(ids);
+      unavailable.clear();
+      observing = true;
+    }
+
+    revision_t revision() {
+      std::scoped_lock lock(mutex);
+      return notification_revision;
+    }
+
+    snapshot_t freeze(const role_device_ids_t &current, const revision_t &before_enumeration) {
+      std::scoped_lock lock(mutex);
+      // A missing/delayed notification is not evidence of our ownership.
+      // Conversely, enumeration must not rewind a newer notification received
+      // while the caller queried defaults. Preserve that newer observation.
+      for (std::size_t i = 0; i < current.size(); ++i) {
+        if (notification_revision[i] == before_enumeration[i]) {
+          if (snapshot.current[i] != current[i]) snapshot.observe(i, current[i], true);
+        }
+      }
+      observing = false;
+      return snapshot;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR id, DWORD state) override {
+      if (!id) return S_OK;
+      std::scoped_lock lock(mutex);
+      if (observing) unavailable[id] = !(state & DEVICE_STATE_ACTIVE);
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR id) override {
+      return OnDeviceStateChanged(id, DEVICE_STATE_NOTPRESENT);
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR id) override {
+      if (flow != eRender || role < eConsole || role >= ERole_enum_count) return S_OK;
+      std::scoped_lock lock(mutex);
+      if (observing) {
+        const auto index = role_index(role);
+        ++notification_revision[index];
+        const auto previous = snapshot.current[index];
+        const bool lost = previous.empty() ? snapshot.displaced[index] : unavailable[previous];
+        snapshot.observe(index, id ? std::wstring(id) : std::wstring {}, !lost);
+      }
+      return S_OK;
+    }
+
+  private:
+    std::mutex mutex;
+    snapshot_t snapshot;
+    std::unordered_map<std::wstring, bool> unavailable;
+    bool observing {false};
+    revision_t notification_revision {};
+  };
+
   class mic_wasapi_t: public mic_t {
   public:
     capture_e sample(std::vector<float> &sample_out) override {
@@ -915,6 +979,47 @@ namespace platf::audio {
       },
     }} {}
 
+    pending_role_restores_t freeze_topology_snapshot(role_device_ids_t &current, const topology_notification_t::revision_t &before_enumeration) {
+      if (topology_frozen) return {};
+      topology_frozen = true;
+      auto observed = topology_notification.freeze(current, before_enumeration);
+      if (!topology_registered) {
+        // No event evidence: preserve current choices instead of guessing.
+        observed.capture(current);
+      }
+      roles_.capture(observed.preferred);
+      current = observed.current;
+      pending_role_restores_t pending;
+      for (std::size_t i = 0; i < current.size(); ++i) {
+        if (observed.pending(i)) {
+          pending.push_back({static_cast<ERole>(i), observed.preferred[i], current[i]});
+        }
+      }
+      return pending;
+    }
+
+    void restore_topology_snapshot() override {
+      if (topology_released || !roles_.assigned().empty()) return;
+      topology_released = true;
+      const auto revision = topology_notification.revision();
+      auto current = current_default_device_ids();
+      auto pending = freeze_topology_snapshot(current, revision);
+      if (pending.empty()) return;
+      // Use the existing epoch-checked per-role worker, with no Steam endpoint:
+      // this path only retries the observed preferred endpoint; it never hides
+      // devices or chooses a fixed fallback. Newer choices retire its ownership.
+      auto handoff = begin_policy_assignment(current);
+      auto inherited = normalize_pending_role_restores(
+        std::move(handoff.role_restores), handoff.steam_device_id, current);
+      for (const auto &entry : inherited) {
+        auto found = std::find_if(pending.begin(), pending.end(),
+          [&](const auto &candidate) { return candidate.role == entry.role; });
+        if (found == pending.end()) pending.push_back(entry);
+        else *found = entry;
+      }
+      start_pending_role_restore_task({}, std::move(pending), handoff.assignment_epoch);
+    }
+
     std::optional<sink_t> sink_info() override {
       sink_t sink;
 
@@ -944,7 +1049,9 @@ namespace platf::audio {
           (void) preferred_device_match_list(device_id);
         }
       }
-      roles_.capture(std::move(default_device_ids));
+      roles_.capture(default_device_ids);
+      topology_notification.capture(default_device_ids);
+      topology_registered = SUCCEEDED(device_enum->RegisterEndpointNotificationCallback(&topology_notification));
 
       // Prepare to search for the device_id of the virtual audio sink device,
       // this device can be either user-configured or
@@ -1109,7 +1216,10 @@ namespace platf::audio {
     int set_sink(const std::string &sink) override {
       auto device_id = set_format(sink);
       if (!device_id) return -1;
-      const auto failure = roles_.assign(*device_id);
+      const auto revision = topology_notification.revision();
+      auto current = current_default_device_ids();
+      auto displaced = freeze_topology_snapshot(current, revision);
+      const auto failure = roles_.assign(*device_id, std::move(displaced));
       if (roles_.assignment_active() && !failure) {
         std::scoped_lock lock(pending_restore_mutex_ref());
         if (policy_assignment_epoch_ref() == roles_.assignment_epoch()) assigned_sink = sink;
@@ -1118,6 +1228,10 @@ namespace platf::audio {
     }
 
     int restore_sink(const std::string &) override {
+      if (roles_.assigned().empty()) {
+        restore_topology_snapshot();
+        return 0;
+      }
       return roles_.restore();
     }
 
@@ -1354,6 +1468,7 @@ namespace platf::audio {
      * @param preferred_device The endpoint device_id of the device to restore.
      */
     void reset_default_device(const std::string &preferred_device = {}) override {
+      if (topology_released && roles_.assigned().empty()) return;
       // A stream can assign a different endpoint to the console, multimedia,
       // and communications roles. Always keep its recovery role-scoped so the
       // legacy all-role fallback cannot overwrite a role that was restored.
@@ -2986,11 +3101,17 @@ namespace platf::audio {
       return 0;
     }
 
-    ~audio_control_t() override = default;
+    ~audio_control_t() override {
+      if (topology_registered) device_enum->UnregisterEndpointNotificationCallback(&topology_notification);
+    }
 
     policy_t policy;
     audio::device_enum_t device_enum;
     role_policy_t roles_;
+    topology_notification_t topology_notification;
+    bool topology_registered {false};
+    bool topology_frozen {false};
+    bool topology_released {false};
     std::string assigned_sink;
     std::wstring capture_device_id;
   };

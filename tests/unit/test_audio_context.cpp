@@ -42,7 +42,7 @@ namespace {
     std::vector<std::string> events;
     std::function<void(role_e, const std::wstring &)> before_write;
     std::function<void()> during_resolve;
-    int writes {}, captures {}, created {}, destroyed {}, pinned {};
+    int writes {}, captures {}, created {}, destroyed {}, pinned {}, topology_releases {};
     bool format_failure {}, factory_failure {}, info_failure {};
 
     ids_t read() {
@@ -112,6 +112,8 @@ namespace {
       roles_.reset_failed(L"stream");
     }
 
+    void restore_topology_snapshot() override { ++fixture_topology_releases(); }
+    int &fixture_topology_releases();
     int set_capture_sink(const std::string &) override;
 
     bool is_sink_available(const std::string &) override {
@@ -245,6 +247,8 @@ namespace {
       roles_ {f.registry, f.devices()} {
     ++f.os.created;
   }
+
+  int &device_control_t::fixture_topology_releases() { return fixture_.os.topology_releases; }
 
   device_control_t::~device_control_t() {
     ++fixture_.os.destroyed;
@@ -1252,6 +1256,16 @@ namespace {
     require(markers == 1, "empty metadata suppressed the native terminal marker");
   }
 
+  void unassigned_topology_release() {
+    fixture_t f;
+    {
+      auto hold = f.manager.before_display_change(true);
+      require(hold != nullptr, "missing pre-display hold");
+      require(f.os.topology_releases == 0, "early topology release");
+    }
+    require(f.os.topology_releases == 1 && f.os.writes == 0, "unassigned context did not release topology exactly once");
+  }
+
   void denied_request_is_lazy() {
     fixture_t f;
     {
@@ -1348,6 +1362,7 @@ int main(int argc, char **argv) {
     {"roles.late_worker_successor", late_worker_cannot_overwrite_successor},
     {"roles.scheduler_failure", scheduler_failure},
     {"context.aborted_launch", aborted_launch},
+    {"context.unassigned_topology_release", unassigned_topology_release},
     {"context.failures_capture_only", failures_and_capture_only},
     {"context.partial_assignment", partial_assignment},
     {"context.pause_resume", [] {

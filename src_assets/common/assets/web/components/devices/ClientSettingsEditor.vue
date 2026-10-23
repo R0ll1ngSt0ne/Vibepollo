@@ -36,6 +36,7 @@ export interface ClientDeviceDraft {
   virtualDisplayMode: ClientVirtualDisplayMode;
   virtualDisplayLayout: ClientVirtualDisplayLayout;
   hdrProfile: string;
+  steamAccountId?: string;
   prefer10BitSdr: boolean;
   configOverrides: Record<string, unknown>;
 }

@@ -163,13 +163,19 @@ namespace audio {
       return result;
     }
 
-    int assign(const std::wstring &endpoint) {
+    int assign(const std::wstring &endpoint, pending_list_t displaced = {}) {
       const auto current = devices_.defaults();
       ids_t desired;
       desired.fill(endpoint);
       auto handoff = begin(std::move(desired));
       assignment_epoch_ = handoff.assignment_epoch;
       auto inherited = normalize(std::move(handoff.role_restores), handoff.steam_device_id, current);
+      // An inherited recovery owns an earlier baseline than this topology change.
+      for (auto &candidate : displaced) {
+        bool present = false;
+        for (const auto &entry : inherited) present |= entry.role == candidate.role;
+        if (!present) inherited.push_back(std::move(candidate));
+      }
       if (assigned_.empty()) {
         // A snapshot taken before topology mutation is authoritative. Reading
         // live defaults here would replace DP/HDMI with Windows' fallback.
@@ -202,7 +208,7 @@ namespace audio {
           }
         }
       }
-      if (assignment_active_ && !failed.empty() && !handoff.steam_device_id.empty()) {
+      if (assignment_active_ && !failed.empty()) {
         schedule(handoff.steam_device_id, std::move(failed), assignment_epoch_);
       }
       return failures;
