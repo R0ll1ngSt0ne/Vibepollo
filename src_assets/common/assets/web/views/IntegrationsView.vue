@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { parseSavedSteamManagement } from '@/utils/steamAccounts';
 import SteamStreamingSettings, { type StreamingStatus } from '@/components/settings/SteamStreamingSettings.vue';
 import { providerSupported } from '@/utils/providerCapabilities';
 import GameLibrarySetup from '../../web-legacy/components/GameLibrarySetup.vue';
@@ -178,6 +179,8 @@ const libraryApps = ref<LibraryApp[]>([]);
 const libraryAppsLoaded = ref(false);
 const playniteLaunching = ref(false);
 const steam = ref<SteamStatus | null>(null);
+const savedSteamManagement = ref<boolean | undefined>();
+const steamPolicyReadError = ref(false);
 const steamGames = ref<SteamGame[]>([]);
 const steamGamesLoading = ref(false);
 const steamGamesError = ref('');
@@ -474,8 +477,12 @@ async function loadLutrisGames(resetDraft = true): Promise<void> {
   }
 }
 
-async function load(preserveNotice = false): Promise<void> {
-  if (refreshing.value) return;
+let reloadAfterRefresh = false;
+async function load(preserveNotice = false, queueIfBusy = false): Promise<void> {
+  if (refreshing.value) {
+    if (queueIfBusy) reloadAfterRefresh = true;
+    return;
+  }
   refreshing.value = true;
   if (!preserveNotice) notice.value = '';
   const nextErrors: Partial<Record<IntegrationId, string>> = {};
@@ -484,6 +491,12 @@ async function load(preserveNotice = false): Promise<void> {
 
   const steamResult = providerSupported(system.metadata, 'steam')
     ? (await Promise.allSettled([apiGet<SteamStatus>('/api/steam/status')]))[0] : undefined;
+  if (steamResult?.status === 'fulfilled' && steamResult.value.companion?.supported) {
+    try {
+      savedSteamManagement.value = parseSavedSteamManagement(await apiGet('/api/config', { cache: 'no-store' }));
+      steamPolicyReadError.value = false;
+    } catch { steamPolicyReadError.value = true; }
+  }
   const lutrisResult = providerSupported(system.metadata, 'lutris')
     ? (await Promise.allSettled([apiGet<LutrisStatus>('/api/lutris/status')]))[0]
     : undefined;
@@ -557,6 +570,7 @@ async function load(preserveNotice = false): Promise<void> {
   errors.value = nextErrors;
   loading.value = false;
   refreshing.value = false;
+  if (reloadAfterRefresh) { reloadAfterRefresh = false; await load(true); }
 }
 
 function playniteSummary(): IntegrationSummary {
@@ -1894,7 +1908,7 @@ function libraryRequest(
               </div>
             </div>
           </section>
-          <SteamStreamingSettings v-if="summary.id === 'steam' && steam?.companion" :status="steam.companion" @changed="load(true)" />
+          <SteamStreamingSettings v-if="summary.id === 'steam' && steam?.companion" :status="steam.companion" :refreshing="refreshing" :status-error="!!errors.steam || steamPolicyReadError" :saved-account-management="savedSteamManagement" @changed="load(true, true)" />
         </div>
         <div v-if="summary.id === 'steam' || summary.id === 'lutris' || isWindows" class="integration-row__actions">
           <template v-if="summary.id === 'steam'">

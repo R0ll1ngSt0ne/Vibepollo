@@ -23,15 +23,32 @@ export function parseRememberedSteamAccounts(payload: unknown): RememberedSteamA
   });
 }
 
-export function steamAccountOptions(accounts: RememberedSteamAccount[], assigned: string) {
-  const options = [{ value: '', label: 'Keep current account' }];
+export function steamAccountOptions(accounts: RememberedSteamAccount[], assigned: string, loaded = true, known: RememberedSteamAccount[] = []) {
+  const options = [{ value: '', label: 'Do not switch Steam account' }];
   for (const account of accounts) options.push({
     value: account.steam_id,
     label: account.persona_name.trim()
       ? `${account.persona_name} (${account.account_name})`
       : account.account_name,
   });
-  if (assigned && !accounts.some((account) => account.steam_id === assigned))
-    options.push({ value: assigned, label: 'Previously assigned account (not currently listed)' });
+  if (assigned && !accounts.some((account) => account.steam_id === assigned)) {
+    const cached = known.find(account => account.steam_id === assigned);
+    const name = cached ? (cached.persona_name.trim() ? `${cached.persona_name} (${cached.account_name})` : cached.account_name) : 'Saved account';
+    options.push({ value: assigned, label: `${name} (${loaded ? 'not in account list' : 'name unavailable'})` });
+  }
   return options;
+}
+
+// GET /api/config returns persisted strings, unlike the effective runtime status.
+export function parseSavedSteamManagement(payload: unknown): boolean | undefined {
+  const data = payload as { status?: unknown; steam_account_management?: unknown } | null;
+  if (!data || data.status !== true) throw new Error('saved-policy-unavailable');
+  const value = data.steam_account_management;
+  if (value === undefined) return undefined; // Legacy assignments retain effective protection.
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (/^(true|1|yes|on)$/i.test(value)) return true;
+    if (/^(false|0|no|off)$/i.test(value)) return false;
+  }
+  throw new Error('invalid-saved-policy');
 }
